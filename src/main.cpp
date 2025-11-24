@@ -4,6 +4,7 @@
 #include <numeric>
 #include <filesystem>
 #include <fstream>
+#include <climits>
 
 #include "dataset.hpp"
 #include "autoencoder.hpp"
@@ -42,7 +43,6 @@ int main(int argc, char** argv){
     CIFAR10 ds;
     ds.load(cifar_dir);
 
-    const Tensor& all = ds.images();
     int Ntrain = ds.train_size();
     int Ntest  = ds.test_size();
     std::cout << "Total images: " << (Ntrain + Ntest)
@@ -58,41 +58,36 @@ int main(int argc, char** argv){
 
     std::filesystem::create_directory("out");
 
-    // shuffled index list
-    std::vector<int> idx(Ntrain);
-    std::iota(idx.begin(), idx.end(), 0);
+    // Create data loaders
+    DataLoader train_loader(ds.train_images(), ds.train_labels(), batch, true);   // shuffle
+    DataLoader test_loader(ds.test_images(), ds.test_labels(), batch, false);     // no shuffle
+
+    // DEBUG: limit to 1 batch for testing
+    bool debug = true;  // Set to true to debug with only 1 batch
+    int max_batches = debug ? 1 : INT_MAX;
+
+    if (debug) {
+        std::cout << "\n=== DEBUG MODE: Running with 1 batch only ===\n\n";
+    }
 
     // =========================
     // Training Loop
     // =========================
     for (int ep = 1; ep <= epochs; ++ep) {
-
-        std::mt19937 rng(1234 + ep);
-        std::shuffle(idx.begin(), idx.end(), rng);
-
+        train_loader.reset(true);  // reset and reshuffle
+        
         auto t0 = std::chrono::high_resolution_clock::now();
         double epoch_loss = 0.0;
         int nb = 0;
 
-        for (int i = 0; i < Ntrain; i += batch) {
-            int cur = std::min(batch, Ntrain - i);
-
-            // mini-batch tensor
-            Tensor x(cur, 3, 32, 32);
+        while (train_loader.has_next() && nb < max_batches) { // DEBUG: nb < max_batches to limit only 1 batch per epoch
+            auto batch_data = train_loader.next();
+            const Tensor& x = batch_data.images;
 
             // print progress occasionally
-            if (i > 0 && i % 512 == 0) {
+            if (nb > 0 && nb % 16 == 0) {
                 std::cout << "[Epoch " << ep
-                          << "] processing batch at index " << i << "\n";
-            }
-
-            // copy data from dataset → x
-            for (int k = 0; k < cur; ++k) {
-                int id = idx[i + k];
-                for (int c = 0; c < 3; ++c)
-                for (int h = 0; h < 32; ++h)
-                for (int w = 0; w < 32; ++w)
-                    x.at(k, c, h, w) = all.at(id, c, h, w);
+                          << "] batch " << nb << "/" << train_loader.num_batches() << "\n";
             }
 
             // ----- FORWARD -----
@@ -111,7 +106,7 @@ int main(int argc, char** argv){
         double sec = std::chrono::duration<double>(t1 - t0).count();
 
         std::cout << "Epoch " << ep
-                  << " | loss=" << (epoch_loss / nb)
+                  << " | train_loss=" << (epoch_loss / nb)
                   << " | time=" << sec << "s\n";
 
         // --------------------------
@@ -121,12 +116,36 @@ int main(int argc, char** argv){
         for (int c=0; c<3; ++c)
         for (int h=0; h<32; ++h)
         for (int w=0; w<32; ++w)
-            one.at(0,c,h,w) = all.at(0,c,h,w);
+            one.at(0,c,h,w) = ds.train_images().at(0,c,h,w);
 
         const Tensor& recon = ae.forward(one);
 
         save_ppm("out/ep" + std::to_string(ep) + "_orig.ppm", one);
         save_ppm("out/ep" + std::to_string(ep) + "_recon.ppm", recon);
+    }
+
+    // =========================
+    // Final Test Evaluation (Bring out the code inside true branch if no need for DEBUG)
+    // =========================
+    if (!debug) {
+        std::cout << "\n=== Final Test Evaluation ===\n";
+        test_loader.reset(false);
+        double test_loss = 0.0;
+        int test_nb = 0;
+
+        while (test_loader.has_next()) {
+            auto batch_data = test_loader.next();
+            const Tensor& x_test = batch_data.images;
+
+            const Tensor& y_test = ae.forward(x_test);
+            auto [loss, dY] = criterion.forward_backward(y_test, x_test);
+            test_loss += loss;
+            ++test_nb;
+        }
+
+        std::cout << "Final test_loss=" << (test_loss / test_nb) << "\n";
+    } else {
+        std::cout << "\n(Skipping test evaluation in debug mode)\n";
     }
 
     std::cout << "Done. Check ./out/*.ppm\n";

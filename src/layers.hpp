@@ -67,7 +67,6 @@ public:
         for(int w=0;w<x.W();++w)
         {
             float gout = dY.at(n,oc,h,w);
-            gb_[oc] += gout;
 
             for(int ic=0;ic<inC_;++ic)
             for(int kh=-1;kh<=1;++kh)
@@ -80,6 +79,8 @@ public:
                 gW_[widx] += x.at(n,ic,ih,iw) * gout;
                 dX_.at(n,ic,ih,iw) += W_[widx] * gout;
             }
+            
+            gb_[oc] += gout;
         }
         return dX_;
     }
@@ -248,7 +249,7 @@ public:
         const auto& t = target.raw();
         auto& g = dX_.raw();
 
-        const size_t N = p.size();
+        const size_t N = p.size(); //batch size
         float s = 0.f;
 
         for (size_t i = 0; i < N; ++i) {
