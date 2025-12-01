@@ -93,11 +93,23 @@ public:
 
         // Chỉ giữ lại 5000 ảnh train và 1000 ảnh test
         if (train_images_.N() > 5000) {
-            train_images_ = train_images_.slice(0, 5000); // slice(n_start, n_end)
+            Tensor tmp(5000, 3, 32, 32);
+            for (int i = 0; i < 5000; ++i)
+                for (int c = 0; c < 3; ++c)
+                for (int h = 0; h < 32; ++h)
+                for (int w = 0; w < 32; ++w)
+                    tmp.at(i, c, h, w) = train_images_.at(i, c, h, w);
+            train_images_ = std::move(tmp);
             train_labels_.resize(5000);
         }
         if (test_images_.N() > 1000) {
-            test_images_ = test_images_.slice(0, 1000);
+            Tensor tmp(1000, 3, 32, 32);
+            for (int i = 0; i < 1000; ++i)
+                for (int c = 0; c < 3; ++c)
+                for (int h = 0; h < 32; ++h)
+                for (int w = 0; w < 32; ++w)
+                    tmp.at(i, c, h, w) = test_images_.at(i, c, h, w);
+            test_images_ = std::move(tmp);
             test_labels_.resize(1000);
         }
     }
