@@ -109,6 +109,9 @@ int main(int argc, char** argv){
                   << " | train_loss=" << (epoch_loss / nb)
                   << " | time=" << sec << "s\n";
 
+        // Lưu weights sau mỗi epoch
+        ae.save_weights("out/weights_epoch_" + std::to_string(ep) + ".bin");
+
         // --------------------------
         // dump reconstruction example
         // --------------------------

@@ -98,8 +98,8 @@ public:
     const std::vector<uint8_t>& test_labels() const { return test_labels_; }
 
     // by CIFAR convention:
-    int train_size() const { return 50000; }
-    int test_size()  const { return 10000; }
+    int train_size() const { return 5000; }
+    int test_size()  const { return 1000; }
 };
 
 // -------------------- DataLoader --------------------

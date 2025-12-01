@@ -69,4 +69,22 @@ public:
         const Tensor& da1 = c1_.backward(da2);
         c1_.sgd(lr);
     }
+
+    void save_weights(const std::string& path) {
+        std::ofstream out(path, std::ios::binary);
+        if (!out) return;
+
+        auto save_conv = [&](const Conv2D& conv) {
+            const auto& w = conv.weights();
+            size_t sz = w.size();
+            out.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
+            out.write(reinterpret_cast<const char*>(w.data()), sz * sizeof(float));
+        };
+
+        save_conv(c1_);
+        save_conv(c2_);
+        save_conv(c3_);
+        save_conv(c4_);
+        save_conv(c5_);
+    }
 };
