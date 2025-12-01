@@ -63,7 +63,7 @@ int main(int argc, char** argv){
     DataLoader test_loader(ds.test_images(), ds.test_labels(), batch, false);     // no shuffle
 
     // DEBUG: limit to 1 batch for testing
-    bool debug = true;  // Set to true to debug with only 1 batch
+    bool debug = false;  // Set to true to debug with only 1 batch
     int max_batches = debug ? 1 : INT_MAX;
 
     if (debug) {
