@@ -89,6 +89,12 @@ public:
         for(size_t i=0;i<W_.size();++i) W_[i] -= lr * gW_[i];
         for(size_t i=0;i<b_.size();++i) b_[i] -= lr * gb_[i];
     }
+
+    // Trả về tham chiếu tới vector chứa trọng số
+    const std::vector<float>& weights() const { return W_; }
+
+    // Nếu muốn lưu cả bias, thêm hàm này:
+    const std::vector<float>& bias() const { return b_; }
 };
 
 // -------------------- ReLU --------------------
