@@ -90,6 +90,16 @@ public:
                 test_images_.at((int)i,2,h,w) = pix[2048+idx] / 255.f;
             }
         }
+
+        // Chỉ giữ lại 5000 ảnh train và 1000 ảnh test
+        if (train_images_.N() > 5000) {
+            train_images_ = train_images_.slice(0, 5000); // slice(n_start, n_end)
+            train_labels_.resize(5000);
+        }
+        if (test_images_.N() > 1000) {
+            test_images_ = test_images_.slice(0, 1000);
+            test_labels_.resize(1000);
+        }
     }
 
     const Tensor& train_images() const { return train_images_; }
