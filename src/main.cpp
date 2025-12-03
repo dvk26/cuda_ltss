@@ -33,15 +33,67 @@ static void save_ppm(const std::string& path, const Tensor& imgNCHW, int n=0) {
 // ============================================
 int main(int argc, char** argv){
     if (argc < 2) {
-        std::cerr << "Usage: ./autoencoder <cifar-10-batches-bin>\n";
+        std::cerr << "Usage: ./autoencoder <cifar-10-batches-bin> [--debug {true|false}] [--keep-10-percent {true|false}]\n";
         return 1;
     }
 
     std::string cifar_dir = argv[1];
 
+    //ARGUMENT-PARSING SECTION
+    /*
+    --debug:
+        - true: only run 2 epochs, each using 2 first batches (32 samples each)
+        - false: run up to 20 epochs, with full datasets
+    --keep-10-percent
+        - true: only retain 5000 training samples and 1000 testing samples
+        - false: retain entire dataset (50000 training samples, 10000 testing samples)
+    */
+    bool debug = false;
+    bool keep_10_percent = true;
+    
+    int i = 2;
+    while (i < argc) {
+        std::string arg = argv[i];
+        
+        if (arg == "--debug") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --debug requires a value (true|false)\n";
+                return 1;
+            }
+            std::string debug_str = argv[i + 1];
+            if (debug_str == "true") {
+                debug = true;
+            } else if (debug_str == "false") {
+                debug = false;
+            } else {
+                std::cerr << "Error: --debug parameter must be 'true' or 'false', got '" << debug_str << "'\n";
+                return 1;
+            }
+            i += 2;
+        } else if (arg == "--keep-10-percent") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --keep-10-percent requires a value (true|false)\n";
+                return 1;
+            }
+            std::string keep_str = argv[i + 1];
+            if (keep_str == "true") {
+                keep_10_percent = true;
+            } else if (keep_str == "false") {
+                keep_10_percent = false;
+            } else {
+                std::cerr << "Error: --keep-10-percent parameter must be 'true' or 'false', got '" << keep_str << "'\n";
+                return 1;
+            }
+            i += 2;
+        } else {
+            std::cerr << "Error: Unknown argument '" << arg << "'\n";
+            return 1;
+        }
+    }
+
     std::cout << "Loading CIFAR-10...\n";
     CIFAR10 ds;
-    ds.load(cifar_dir);
+    ds.load(cifar_dir, keep_10_percent);
 
     int Ntrain = ds.train_size();
     int Ntest  = ds.test_size();
@@ -49,8 +101,8 @@ int main(int argc, char** argv){
               << " (train " << Ntrain << ", test " << Ntest << ")\n";
 
     // Hyperparams
-    int batch  = 32;
-    int epochs = 5;
+    int batch_size  = 32;
+    int epochs = debug ? 2 : 20;
     float lr   = 1e-3;
 
     Autoencoder ae;
@@ -59,15 +111,17 @@ int main(int argc, char** argv){
     std::filesystem::create_directory("out");
 
     // Create data loaders
-    DataLoader train_loader(ds.train_images(), ds.train_labels(), batch, true);   // shuffle
-    DataLoader test_loader(ds.test_images(), ds.test_labels(), batch, false);     // no shuffle
+    DataLoader train_loader(ds.train_images(), ds.train_labels(), batch_size, true);   // shuffle
+    DataLoader test_loader(ds.test_images(), ds.test_labels(), batch_size, false);     // no shuffle
 
-    // DEBUG: limit to 1 batch for testing
-    bool debug = false;  // Set to true to debug with only 1 batch
-    int max_batches = debug ? 1 : INT_MAX;
+    // DEBUG: limit batches
+    int train_max_batches = debug ? 2 : INT_MAX;
 
     if (debug) {
-        std::cout << "\n=== DEBUG MODE: Running with 1 batch only ===\n\n";
+        std::cout << "\n=== DEBUG MODE: Running with 2 batches per epoch ===\n\n";
+    }
+    else {
+        std::cout << "\n=== NON-DEBUG MODE ===\n\n";
     }
 
     // =========================
@@ -78,16 +132,16 @@ int main(int argc, char** argv){
         
         auto t0 = std::chrono::high_resolution_clock::now();
         double epoch_loss = 0.0;
-        int nb = 0;
+        int train_nb = 0;
 
-        while (train_loader.has_next() && nb < max_batches) { // DEBUG: nb < max_batches to limit only 1 batch per epoch
+        while (train_loader.has_next() && train_nb < train_max_batches) { // DEBUG: train_nb < train_max_batches to limit only 2 batches per epoch
             auto batch_data = train_loader.next();
             const Tensor& x = batch_data.images;
 
             // print progress occasionally
-            if (nb > 0 && nb % 16 == 0) {
+            if (train_nb > 0 && train_nb % 16 == 0) {
                 std::cout << "[Epoch " << ep
-                          << "] batch " << nb << "/" << train_loader.num_batches() << "\n";
+                          << "] batch " << train_nb << "/" << train_loader.num_batches() << "\n";
             }
 
             // ----- FORWARD -----
@@ -96,7 +150,7 @@ int main(int argc, char** argv){
             // ----- LOSS + dLoss/dY -----
             auto [loss, dY] = criterion.forward_backward(y, x);
             epoch_loss += loss;
-            ++nb;
+            ++train_nb;
 
             // ----- BACKWARD + UPDATE -----
             ae.backward_and_update(dY, lr);
@@ -106,7 +160,7 @@ int main(int argc, char** argv){
         double sec = std::chrono::duration<double>(t1 - t0).count();
 
         std::cout << "Epoch " << ep
-                  << " | train_loss=" << (epoch_loss / nb)
+                  << " | train_loss=" << (epoch_loss / train_nb)
                   << " | time=" << sec << "s\n";
 
         // Lưu weights sau mỗi epoch
@@ -128,28 +182,25 @@ int main(int argc, char** argv){
     }
 
     // =========================
-    // Final Test Evaluation (Bring out the code inside true branch if no need for DEBUG)
+    // Final Test Evaluation
     // =========================
-    if (!debug) {
-        std::cout << "\n=== Final Test Evaluation ===\n";
-        test_loader.reset(false);
-        double test_loss = 0.0;
-        int test_nb = 0;
+    std::cout << "\n=== Final Test Evaluation ===\n";
+    test_loader.reset(false);
+    double test_loss = 0.0;
+    int test_nb = 0;
+    int test_max_batches = debug ? 2 : INT_MAX;
 
-        while (test_loader.has_next()) {
-            auto batch_data = test_loader.next();
-            const Tensor& x_test = batch_data.images;
+    while (test_loader.has_next() && test_nb < test_max_batches) {
+        auto batch_data = test_loader.next();
+        const Tensor& x_test = batch_data.images;
 
-            const Tensor& y_test = ae.forward(x_test);
-            auto [loss, dY] = criterion.forward_backward(y_test, x_test);
-            test_loss += loss;
-            ++test_nb;
-        }
-
-        std::cout << "Final test_loss=" << (test_loss / test_nb) << "\n";
-    } else {
-        std::cout << "\n(Skipping test evaluation in debug mode)\n";
+        const Tensor& y_test = ae.forward(x_test);
+        auto [loss, dY] = criterion.forward_backward(y_test, x_test);
+        test_loss += loss;
+        ++test_nb;
     }
+
+    std::cout << "Final test_loss=" << (test_loss / test_nb) << "\n";
 
     std::cout << "Done. Check ./out/*.ppm\n";
     return 0;
