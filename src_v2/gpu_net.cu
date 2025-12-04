@@ -1,7 +1,7 @@
 #include "gpu_net.hpp"
+#include "gpu_kernels.cuh"
 #include <random>
 #include <vector>
-#include "gpu_kernels.cuh"
 
 GPUNet::GPUNet(int Nmax_) : Nmax(Nmax_) {
     // 1) cudaMalloc weights/bias + gradients
