@@ -2,6 +2,16 @@
 #include "dataset.hpp"
 #include "gpu_net.hpp"
 
+// Thêm macro CUDA_CHECK vào đây
+#define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
+    if (code != cudaSuccess) {
+        std::cerr << "CUDA Error: " << cudaGetErrorString(code)
+                  << " " << file << " " << line << std::endl;
+        if (abort) exit(code);
+    }
+}
+
 int main(int argc, char** argv) {
     std::string cifar_dir = argv[1];
     CIFAR10 ds;
