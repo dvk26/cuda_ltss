@@ -389,3 +389,13 @@ __global__ void sgd_update_kernel(
     if (idx >= total) return;
     w[idx] -= lr * grad[idx];
 }
+
+// Thêm khai báo này vào cuối file hoặc sau các kernel
+extern float mse_forward_backward(
+    const float* d_pred,
+    const float* d_target,
+    float* d_buf,
+    float* d_dPred,
+    float* d_loss,
+    int total
+);

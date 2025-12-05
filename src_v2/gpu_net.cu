@@ -68,7 +68,6 @@ GPUNet::GPUNet(int Nmax_) : Nmax(Nmax_) {
     // 4) MSE buffers
     int total = Nmax * 3 * 32 * 32;
     CUDA_CHECK(cudaMalloc(&mse_buf,     sizeof(float) * total));
-    CUDA_CHECK(cudaMalloc(&mse_dPred,   sizeof(float) * total));
     CUDA_CHECK(cudaMalloc(&mse_loss_dev, sizeof(float)));
 
     g_out = mse_dPred; // dL/dOut
@@ -133,13 +132,33 @@ void GPUNet::forward(int N) {
     conv3x3_forward(u2, w5, b5, out, N, 256, 32, 32, 3);
 }
 
-float GPUNet::loss(const float* d_target, int N) {
+float GPUNet::loss(const float* d_target, int N)
+{
     int total = N * 3 * 32 * 32;
-    return mse_forward_backward(
-        out, d_target,
-        mse_buf, mse_dPred,
-        mse_loss_dev, total
-    );
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+
+    // DEBUG
+    printf("N=%d total=%d\n", N, total);
+    printf("out=%p d_target=%p mse_buf=%p\n", (void*)out, (void*)d_target, (void*)mse_buf);
+
+    // 1) Tính (out - target)^2
+    mse_diff_kernel<<<blocks, threads>>>(out, d_target, mse_buf, total);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 2) Reset loss scalar về 0
+    CUDA_CHECK(cudaMemset(mse_loss_dev, 0, sizeof(float)));
+
+    // 3) Reduce tổng
+    size_t smem = threads * sizeof(float);
+    mse_reduce_kernel<<<blocks, threads, smem>>>(mse_buf, mse_loss_dev, total);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 4) Copy kết quả về host + chia trung bình
+    float h_loss = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&h_loss, mse_loss_dev, sizeof(float), cudaMemcpyDeviceToHost));
+    h_loss /= (float)total;
+    return h_loss;
 }
 
 void GPUNet::backward(float lr, int N) {
@@ -238,4 +257,40 @@ void GPUNet::backward(float lr, int N) {
 
     sgd_update_kernel<<<(3*256*3*3+255)/256,256>>>(w5, gw5, lr, 3*256*3*3);
     sgd_update_kernel<<<(3+255)/256,256>>>(b5, gb5, lr, 3);
+}
+
+// Tính (out[i] - target[i])^2 vào mse_buf
+__global__ void mse_diff_kernel(const float* __restrict__ out,
+                                const float* __restrict__ target,
+                                float* __restrict__ mse_buf,
+                                int total)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    float d = out[idx] - target[idx];
+    mse_buf[idx] = d * d;
+}
+
+// Reduce tổng mse_buf về 1 số, dùng atomicAdd
+__global__ void mse_reduce_kernel(const float* __restrict__ mse_buf,
+                                  float* __restrict__ loss_out,
+                                  int total)
+{
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float v = 0.0f;
+    if (idx < total) v = mse_buf[idx];
+    sdata[tid] = v;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(loss_out, sdata[0]);
+    }
 }
