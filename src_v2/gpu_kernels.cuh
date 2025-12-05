@@ -198,10 +198,11 @@ __global__ void mse_elementwise_kernel(
     int total
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    float diff = pred[idx] - target[idx];
-    buf[idx]   = diff * diff;
-    dPred[idx] = 2.f * diff / (float)total;
+    if (idx < total) {
+        float diff = pred[idx] - target[idx];
+        buf[idx] = diff * diff;
+        dPred[idx] = 2.0f * diff / total;
+    }
 }
 
 __global__ void reduce_sum_kernel(
