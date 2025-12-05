@@ -13,7 +13,11 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 }
 
 int main(int argc, char** argv) {
-    std::string cifar_dir = argv[1];
+    if (argc < 2 || argv[1] == nullptr) {
+        std::cerr << "Usage: " << argv[0] << " <cifar10_data_dir>\n";
+        return 1;
+    }
+    std::string cifar_dir = argv[1]; // Sửa lại dòng này
     CIFAR10 ds;
     ds.load(cifar_dir, true);
 
