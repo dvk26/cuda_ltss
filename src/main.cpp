@@ -44,8 +44,8 @@ int main(int argc, char** argv){
     --debug:
         - true: only run 2 epochs, each using 2 first batches (32 samples each)
         - false: run up to 20 epochs, with full datasets
-    --keep-10-percent
-        - true: only retain 5000 training samples and 1000 testing samples
+    --keep-little-percent
+        - true: only retain 2000 training samples and 400 testing samples
         - false: retain entire dataset (50000 training samples, 10000 testing samples)
     */
     bool debug = false;
@@ -77,11 +77,11 @@ int main(int argc, char** argv){
             }
             std::string keep_str = argv[i + 1];
             if (keep_str == "true") {
-                keep_10_percent = true;
+                keep_little_percent = true;
             } else if (keep_str == "false") {
-                keep_10_percent = false;
+                keep_little_percent = false;
             } else {
-                std::cerr << "Error: --keep-10-percent parameter must be 'true' or 'false', got '" << keep_str << "'\n";
+                std::cerr << "Error: --keep-little-percent parameter must be 'true' or 'false', got '" << keep_str << "'\n";
                 return 1;
             }
             i += 2;
@@ -93,7 +93,7 @@ int main(int argc, char** argv){
 
     std::cout << "Loading CIFAR-10...\n";
     CIFAR10 ds;
-    ds.load(cifar_dir, keep_10_percent);
+    ds.load(cifar_dir, keep_little_percent);
 
     int Ntrain = ds.train_size();
     int Ntest  = ds.test_size();
@@ -108,7 +108,8 @@ int main(int argc, char** argv){
     Autoencoder ae;
     MSELoss criterion;
 
-    std::filesystem::create_directory("out");
+    std::filesystem::create_directories("/content/drive/MyDrive/ltss_autoencoder_out");
+
 
     // Create data loaders
     DataLoader train_loader(ds.train_images(), ds.train_labels(), batch_size, true);   // shuffle
