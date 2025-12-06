@@ -45,19 +45,7 @@ public:
     // Train 1 batch: x_host là input, lr là learning rate
     // Trả về loss (MSE)
     float train_batch(const Tensor& x_host, float lr);
-    // Getter const
-    const Conv2D& c1() const { return c1_; }
-    const Conv2D& c2() const { return c2_; }
-    const Conv2D& c3() const { return c3_; }
-    const Conv2D& c4() const { return c4_; }
-    const Conv2D& c5() const { return c5_; }
-
-    // Getter non-const (dùng để nhận weight từ GPU copy về)
-    Conv2D& c1() { return c1_; }
-    Conv2D& c2() { return c2_; }
-    Conv2D& c3() { return c3_; }
-    Conv2D& c4() { return c4_; }
-    Conv2D& c5() { return c5_; }
+    
 
 
 private:

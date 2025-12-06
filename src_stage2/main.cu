@@ -1,11 +1,11 @@
 #include "dataset.hpp"
-#include "autoencoder.hpp"
 #include "gpu_autoencoder.hpp"
 #include <iostream>
 #include <chrono>
 #include <filesystem>
 #include <sstream>
 #include <iomanip>
+
 
 namespace fs = std::filesystem;
 
@@ -18,7 +18,7 @@ int main() {
     fs::create_directories(ckpt_dir);
 
     CIFAR10 ds("cifar-10-batches-bin");
-    bool debug = false;
+    bool debug = true;
     int batch_size = 64;
     int epochs = 5;
     float lr = 1e-3f;
