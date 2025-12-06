@@ -49,7 +49,7 @@ int main(int argc, char** argv){
         - false: retain entire dataset (50000 training samples, 10000 testing samples)
     */
     bool debug = false;
-    bool keep_10_percent = true;
+    bool keep_little_percent = true;
     
     int i = 2;
     while (i < argc) {
@@ -164,7 +164,8 @@ int main(int argc, char** argv){
                   << " | time=" << sec << "s\n";
 
         // Lưu weights sau mỗi epoch
-        ae.save_weights("out/weights_epoch_" + std::to_string(ep) + ".bin");
+        ae.save_weights("/content/drive/MyDrive/ltss_autoencoder_out/weights_epoch_"
+                + std::to_string(ep) + ".bin");
 
         // --------------------------
         // dump reconstruction example

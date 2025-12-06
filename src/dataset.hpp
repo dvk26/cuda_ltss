@@ -13,7 +13,8 @@ private:
     Tensor test_images_;                  // [10000,3,32,32] in [0,1]
     std::vector<uint8_t> train_labels_;   // [50000]
     std::vector<uint8_t> test_labels_;    // [10000]
-    bool keep_10_percent_;                // true: keep 10%, false: keep all
+    bool keep_little_percent_;                // true: keep 10%, false: keep all
+                // true: keep 10%, false: keep all
 
     static void read_file(const std::string& path, std::vector<uint8_t>& buf) {
         std::ifstream f(path, std::ios::binary);
@@ -28,8 +29,8 @@ private:
 public:
     CIFAR10() = default;
 
-    void load(const std::string& dir, bool keep_10_percent=true) {
-        keep_10_percent_ = keep_10_percent;
+    void load(const std::string& dir, bool keep_little_percent=true) {
+        keep_little_percent_ = keep_little_percent;
         const int W=32,H=32,C=3, REC=1+W*H*C;
         const char* trains[5] = {
             "data_batch_1.bin","data_batch_2.bin","data_batch_3.bin",
@@ -94,26 +95,26 @@ public:
         }
 
         // Chỉ giữ lại 5000 ảnh train và 1000 ảnh test (10% of original)
-        if (keep_10_percent_) {
-            if (train_images_.N() > 5000) {
-                Tensor tmp(5000, 3, 32, 32);
-                for (int i = 0; i < 5000; ++i)
+        if (keep_little_percent_) {
+            if (train_images_.N() > 2000) {
+                Tensor tmp(2000, 3, 32, 32);
+                for (int i = 0; i < 2000; ++i)
                     for (int c = 0; c < 3; ++c)
                     for (int h = 0; h < 32; ++h)
                     for (int w = 0; w < 32; ++w)
                         tmp.at(i, c, h, w) = train_images_.at(i, c, h, w);
                 train_images_ = std::move(tmp);
-                train_labels_.resize(5000);
+                train_labels_.resize(2000);
             }
-            if (test_images_.N() > 1000) {
-                Tensor tmp(1000, 3, 32, 32);
-                for (int i = 0; i < 1000; ++i)
+            if (test_images_.N() > 400) {
+                Tensor tmp(400, 3, 32, 32);
+                for (int i = 0; i < 400; ++i)
                     for (int c = 0; c < 3; ++c)
                     for (int h = 0; h < 32; ++h)
                     for (int w = 0; w < 32; ++w)
                         tmp.at(i, c, h, w) = test_images_.at(i, c, h, w);
                 test_images_ = std::move(tmp);
-                test_labels_.resize(1000);
+                test_labels_.resize(400);
             }
         }
     }
@@ -123,7 +124,7 @@ public:
     const std::vector<uint8_t>& train_labels() const { return train_labels_; }
     const std::vector<uint8_t>& test_labels() const { return test_labels_; }
 
-    // by CIFAR convention (or actual size if keep_10_percent is false):
+    // by CIFAR convention (or actual size if keep_little_percent is false):
     int train_size() const { return train_images_.N(); }
     int test_size()  const { return test_images_.N(); }
 };
