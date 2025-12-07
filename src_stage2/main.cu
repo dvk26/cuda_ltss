@@ -17,7 +17,8 @@ int main() {
     // Tạo folder lưu weights (nếu chưa có)
     fs::create_directories(ckpt_dir);
 
-    CIFAR10 ds("cifar-10-batches-bin");
+    CIFAR10 ds;
+    ds.load("/cifar-10-batches-bin", true);
     bool debug = true;
     int batch_size = 64;
     int epochs = 5;
