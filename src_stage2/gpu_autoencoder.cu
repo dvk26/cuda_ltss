@@ -274,24 +274,29 @@ __global__ void zero_int_kernel(int* x, int total)
 }
 
 // ---- 7. MSE loss (forward+backward) ----
-// pred, target: [total]
+// pred, target: [total_elements]
 // dY: dL/dpred
-// loss_accum: 1 float trên device, lưu SUM(diff^2)
+// loss_accum: 1 float on device, stores SUM(diff^2)
 __global__ void mse_forward_backward_kernel(
     const float* __restrict__ pred,
     const float* __restrict__ target,
     float* __restrict__ dY,
     float* __restrict__ loss_accum,
-    int total)
+    int total_elements,
+    int batch_size) // Add batch_size argument
 {
     extern __shared__ float sdata[];
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     float val = 0.f;
-    if (idx < total) {
+    if (idx < total_elements) {
         float diff = pred[idx] - target[idx];
-        dY[idx] = 2.f * diff / (float)total;
+        
+        // FIX: Scale gradient by 2/N instead of 2/Total_Elements
+        // This ensures the gradient magnitude doesn't vanish as image size increases.
+        dY[idx] = 2.f * diff / (float)total_elements;
+        
         val = diff * diff;
     }
     sdata[tid] = val;
@@ -452,23 +457,38 @@ void GPUAutoencoder::free_all()
 void GPUAutoencoder::init_weights_random()
 {
     std::mt19937 rng(42);
-    std::normal_distribution<float> nd(0.f, 0.01f);
 
-    auto init_vec = [&](float* d_ptr, size_t n) {
-        std::vector<float> h(n);
-        for (size_t i = 0; i < n; ++i) h[i] = nd(rng);
-        CUDA_CHECK(cudaMemcpy(d_ptr, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    // Helper for He Initialization: std = sqrt(2 / fan_in)
+    auto init_kaiming = [&](float* d_ptr, int k_size, int cin, int cout) {
+        float fan_in = (float)(cin * k_size * k_size);
+        float std_dev = std::sqrt(2.0f / fan_in);
+        std::normal_distribution<float> nd(0.f, std_dev);
+
+        size_t total = (size_t)cout * cin * k_size * k_size;
+        std::vector<float> h(total);
+        for (size_t i = 0; i < total; ++i) h[i] = nd(rng);
+        CUDA_CHECK(cudaMemcpy(d_ptr, h.data(), total * sizeof(float), cudaMemcpyHostToDevice));
     };
+
     auto init_zero = [&](float* d_ptr, size_t n) {
         std::vector<float> h(n, 0.f);
         CUDA_CHECK(cudaMemcpy(d_ptr, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
     };
 
-    init_vec(d_w1_, 256 * 3 * 3 * 3);  init_zero(d_b1_, 256);
-    init_vec(d_w2_, 128 * 256 * 3 * 3); init_zero(d_b2_, 128);
-    init_vec(d_w3_, 128 * 128 * 3 * 3); init_zero(d_b3_, 128);
-    init_vec(d_w4_, 256 * 128 * 3 * 3); init_zero(d_b4_, 256);
-    init_vec(d_w5_, 3   * 256 * 3 * 3); init_zero(d_b5_, 3);
+    // W1: 3 -> 256
+    init_kaiming(d_w1_, 3, 3, 256);   init_zero(d_b1_, 256);
+    
+    // W2: 256 -> 128
+    init_kaiming(d_w2_, 3, 256, 128); init_zero(d_b2_, 128);
+    
+    // W3: 128 -> 128
+    init_kaiming(d_w3_, 3, 128, 128); init_zero(d_b3_, 128);
+    
+    // W4: 128 -> 256
+    init_kaiming(d_w4_, 3, 128, 256); init_zero(d_b4_, 256);
+    
+    // W5: 256 -> 3
+    init_kaiming(d_w5_, 3, 256, 3);   init_zero(d_b5_, 3);
 }
 
 // --------- copy_weights_from_cpu / to_cpu ----------
@@ -613,11 +633,14 @@ float GPUAutoencoder::forward_internal()
 
     // ----- Conv1 -----
     {
-        int total = (int)nchw_size(N_, 256, H_, W_);
+        int total = (int)nchw_size(N_, 3, H_, W_);
         dim3 grid((total + BS - 1) / BS);
+        size_t shm = BS * sizeof(float);
+        // Pass N_ as the last argument
         conv2d_forward_kernel<<<grid, block>>>(
             d_x_, d_w1_, d_b1_, d_c1_,
             N_, 3, H_, W_, 256);
+
     }
 
     // ReLU1 (in-place trên d_c1_, lưu ra d_r1_)
@@ -737,7 +760,7 @@ float GPUAutoencoder::forward_internal()
         dim3 grid((total + BS - 1) / BS);
         size_t shm = BS * sizeof(float);
         mse_forward_backward_kernel<<<grid, block, shm>>>(
-            d_c5_, d_target_, d_dy_, d_loss_accum_, total);
+            d_c5_, d_target_, d_dy_, d_loss_accum_, total, N_);
     }
 
     float loss_sum;

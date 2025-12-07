@@ -21,7 +21,7 @@ int main() {
     bool debug = true;
     int batch_size = 64;
     int epochs = 5;
-    float lr = 1e-3f;
+    float lr = 1e-7f;
 
     DataLoader train_loader(ds.train_images(), ds.train_labels(), batch_size, true);
     DataLoader test_loader(ds.test_images(), ds.test_labels(), batch_size, false);
