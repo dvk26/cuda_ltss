@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     float lr = 1e-3f;
 
     // Output directory
-    const std::string out_dir = "out";
+    const std::string out_dir = "out-gpu";
     fs::create_directories(out_dir);
 
     GPUAutoencoder gpu_ae(batch_size, 32, 32);

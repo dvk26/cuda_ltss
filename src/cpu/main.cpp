@@ -77,7 +77,7 @@ int main(int argc, char** argv){
     Autoencoder ae;
     MSELoss criterion;
 
-    std::filesystem::create_directory("out");
+    std::filesystem::create_directory("out-cpu");
 
     // Create data loaders
     DataLoader train_loader(ds.train_images(), ds.train_labels(), batch_size, true);   // shuffle
