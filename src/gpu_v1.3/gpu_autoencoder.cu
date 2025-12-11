@@ -10,13 +10,18 @@
 // ====================================================
 // OPTIMIZED KERNELS (SHARED MEMORY)
 // ====================================================
+// ====================================================
+// OPTIMIZED KERNELS (Fix 3D Grid Limit)
+// ====================================================
 
 #define TILE_W 16
 #define K_SIZE 3
 #define HALO_R 1 
 #define SM_W (TILE_W + 2 * HALO_R) // 18
 
-// ---- 0. MSE Loss Kernel (Moved Up) ----
+// ... (Giữ nguyên MSE Loss Kernel) ...
+
+
 __global__ void mse_loss_kernel(
     const float* __restrict__ pred,
     const float* __restrict__ target,
@@ -33,20 +38,27 @@ __global__ void mse_loss_kernel(
         float p = pred[idx];
         float t = target[idx];
         float diff = p - t;
-        dY[idx] = (2.0f * diff) / (float)total_elements; // Gradient
-        s_loss[tid] = diff * diff; // Loss
+        // Gradient dY = 2/N * (P - T)
+        dY[idx] = (2.0f * diff) / (float)total_elements;
+        // Loss accumulation
+        s_loss[tid] = diff * diff;
     }
     __syncthreads();
 
+    // Reduction loss trong block
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) s_loss[tid] += s_loss[tid + stride];
+        if (tid < stride) {
+            s_loss[tid] += s_loss[tid + stride];
+        }
         __syncthreads();
     }
 
-    if (tid == 0) atomicAdd(loss_out, s_loss[0]);
+    if (tid == 0) {
+        atomicAdd(loss_out, s_loss[0]);
+    }
 }
 
-// ---- 1a. Tiled Conv2D Forward (Standard - Cho lớp cuối) ----
+// ---- 1a. Tiled Conv2D Forward (Standard) ----
 __global__ void conv2d_forward_tiled_kernel(
     const float* __restrict__ x,
     const float* __restrict__ w,
@@ -56,8 +68,15 @@ __global__ void conv2d_forward_tiled_kernel(
 {
     __shared__ float s_x[SM_W][SM_W];
     int tx = threadIdx.x; int ty = threadIdx.y;
-    int bx = blockIdx.x; int by = blockIdx.y; int bz = blockIdx.z;
-    int n = bz; int c_out = blockIdx.w;
+    int bx = blockIdx.x; int by = blockIdx.y; 
+    
+    // --- FIX: Map Z-axis to (Batch, ChannelOut) ---
+    // Grid.z = N * Cout
+    int total_z = blockIdx.z;
+    int c_out = total_z % Cout;
+    int n     = total_z / Cout; 
+    // ----------------------------------------------
+
     int h_out = by * TILE_W + ty;
     int w_out = bx * TILE_W + tx;
 
@@ -94,7 +113,7 @@ __global__ void conv2d_forward_tiled_kernel(
     }
 }
 
-// ---- 1b. [NEW] Fused Conv2D + ReLU Forward (v1.4) ----
+// ---- 1b. Fused Conv2D + ReLU Forward (v1.4) ----
 __global__ void conv2d_relu_forward_tiled_kernel(
     const float* __restrict__ x,
     const float* __restrict__ w,
@@ -102,11 +121,16 @@ __global__ void conv2d_relu_forward_tiled_kernel(
     float* __restrict__ y,
     int N, int Cin, int H, int W, int Cout)
 {
-    // ... Copy Logic Load Shared Memory giống hệt kernel 1a ...
     __shared__ float s_x[SM_W][SM_W];
     int tx = threadIdx.x; int ty = threadIdx.y;
-    int bx = blockIdx.x; int by = blockIdx.y; int bz = blockIdx.z;
-    int n = bz; int c_out = blockIdx.w;
+    int bx = blockIdx.x; int by = blockIdx.y; 
+    
+    // --- FIX: Map Z-axis to (Batch, ChannelOut) ---
+    int total_z = blockIdx.z;
+    int c_out = total_z % Cout;
+    int n     = total_z / Cout;
+    // ----------------------------------------------
+
     int h_out = by * TILE_W + ty;
     int w_out = bx * TILE_W + tx;
 
@@ -137,33 +161,30 @@ __global__ void conv2d_relu_forward_tiled_kernel(
         __syncthreads();
     }
     
-    // --- FUSION: Apply ReLU ---
+    // FUSION: Apply ReLU
     if (h_out < H && w_out < W) {
         float val = (sum > 0.f) ? sum : 0.f; 
         y[((n * Cout + c_out) * H + h_out) * W + w_out] = val;
     }
 }
+
 // ---- 2. Conv2D Backward DATA (dX) - NO ATOMICS ----
-// Tính dX bằng cách gom gradient từ dY xung quanh (Gather)
-// Đây thực chất là một phép Convolution của dY với Weights (được lật)
 __global__ void conv2d_backward_data_tiled_kernel(
     const float* __restrict__ w,
     const float* __restrict__ dY,
     float* __restrict__ dX,
     int N, int Cin, int H, int W, int Cout)
 {
-    // Chúng ta tính dX[n, c_in, h, w]
-    // Cần sum(dY[n, c_out, h', w'] * W[c_out, c_in, kh, kw])
-    
-    // Tương tự forward, dùng Shared Memory để cache dY
     __shared__ float s_dy[SM_W][SM_W];
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
-    int bz = blockIdx.z; // n
-    int c_in = blockIdx.w; // c_in
+    int tx = threadIdx.x; int ty = threadIdx.y;
+    int bx = blockIdx.x; int by = blockIdx.y; 
+    
+    // --- FIX: Map Z-axis to (Batch, ChannelIn) ---
+    // Output của kernel này là dX có số channel là Cin
+    int total_z = blockIdx.z;
+    int c_in = total_z % Cin;
+    int bz   = total_z / Cin; // batch index
+    // ---------------------------------------------
 
     int h_in = by * TILE_W + ty;
     int w_in = bx * TILE_W + tx;
@@ -171,7 +192,6 @@ __global__ void conv2d_backward_data_tiled_kernel(
     float sum_dx = 0.0f;
 
     for (int c_out = 0; c_out < Cout; ++c_out) {
-        // Load dY Tile
         int h_base = by * TILE_W - HALO_R;
         int w_base = bx * TILE_W - HALO_R;
         int tid = ty * TILE_W + tx;
@@ -181,7 +201,6 @@ __global__ void conv2d_backward_data_tiled_kernel(
             int c_sm = i % SM_W;
             int h_dy = h_base + r;
             int w_dy = w_base + c_sm;
-
             float val = 0.f;
             if (h_dy >= 0 && h_dy < H && w_dy >= 0 && w_dy < W) {
                 val = dY[((bz * Cout + c_out) * H + h_dy) * W + w_dy];
@@ -190,33 +209,12 @@ __global__ void conv2d_backward_data_tiled_kernel(
         }
         __syncthreads();
 
-        // Convolution "Gather"
-        // dX tại (h,w) nhận đóng góp từ dY tại (h+kh-1, w+kw-1)
-        // Lưu ý: index weight phải map ngược lại vì đây là correlation
-        // Công thức chuẩn: dX[h,w] += dY[h+i, w+j] * W[c_out, c_in, 1-i, 1-j] (với kernel 3x3, zero centered)
-        // Map sang 0..2: dY tại offset (kh-1), weight tại (2-kh)
-        
         if (h_in < H && w_in < W) {
             for (int kh = 0; kh < 3; ++kh) {
                 for (int kw = 0; kw < 3; ++kw) {
-                    // Lấy dY từ shared mem
-                    // Tại sao lại là [ty + (2-kh)][tx + (2-kw)]?
-                    // Đây là do phép lật kernel trong backward pass.
-                    // Tuy nhiên để đơn giản hoá tư duy:
-                    // Pixel Input(h,w) ảnh hưởng đến Output(h-1, w-1) qua Weight(2,2)
-                    // ... ảnh hưởng đến Output(h+1, w+1) qua Weight(0,0)
-                    // Nên ta cần lấy dY(h-1..h+1). 
-                    // Trong shared mem, dY đã load centered.
-                    // Weight index: [c_out, c_in, kh, kw]
-                    // dY offset tương ứng: (1-kh), (1-kw)
-                    // Shared mem index: ty + 1 + (1-kh) = ty + 2 - kh
-                    
                     int s_r = ty + 2 - kh;
                     int s_c = tx + 2 - kw;
-                    
-                    // Weight: [c_out, c_in, kh, kw]
                     int w_idx = ((c_out * Cin + c_in) * 3 + kh) * 3 + kw;
-                    
                     sum_dx += s_dy[s_r][s_c] * w[w_idx];
                 }
             }
@@ -592,8 +590,7 @@ void launch_conv2d_tiled(
     dim3 grid(
         (W + 15) / 16, 
         (H + 15) / 16, 
-        N, 
-        Cout
+        N * Cout 
     );
     conv2d_forward_tiled_kernel<<<grid, block>>>(x, w, b, y, N, Cin, H, W, Cout);
     CUDA_CHECK(cudaGetLastError());
@@ -605,7 +602,12 @@ void launch_conv2d_relu_tiled(
     int N, int Cin, int H, int W, int Cout)
 {
     dim3 block(16, 16);
-    dim3 grid((W + 15)/16, (H + 15)/16, N, Cout);
+    // Grid.z = N * Cout (Gộp Batch và ChannelOut)
+    dim3 grid(
+        (W + 15) / 16, 
+        (H + 15) / 16, 
+        N * Cout 
+    );
     conv2d_relu_forward_tiled_kernel<<<grid, block>>>(x, w, b, y, N, Cin, H, W, Cout);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -837,19 +839,18 @@ void launch_conv2d_backward(
     float* dX, float* gW, float* gb,
     int N, int Cin, int H, int W, int Cout)
 {
-    // 1. Tính dX (Dùng Tiled Kernel, không atomic)
-    // Grid structure: (GridW, GridH, Batch, Cin) <-- Output là Cin
+    // 1. Tính dX
     dim3 block(16, 16);
+    // Grid.z = N * Cin (Gộp Batch và ChannelIn)
     dim3 grid_data(
         (W + 15) / 16,
         (H + 15) / 16,
-        N,
-        Cin // Lưu ý: Loop output là Cin
+        N * Cin 
     );
     conv2d_backward_data_tiled_kernel<<<grid_data, block>>>(w, dY, dX, N, Cin, H, W, Cout);
     CUDA_CHECK(cudaGetLastError());
 
-    // 2. Tính gW, gb (Dùng Kernel Atomic cũ nhưng riêng biệt)
+    // 2. Tính gW, gb (Giữ nguyên kernel atomic cũ)
     const int BS = 256;
     dim3 block_filter(BS);
     dim3 grid_filter((N * Cout * H * W + BS - 1) / BS);
@@ -857,9 +858,7 @@ void launch_conv2d_backward(
     CUDA_CHECK(cudaGetLastError());
 }
 
-
-
-void GPUAutoencoder::backward_pass(const float* d_dy_, float lr)
+void GPUAutoencoder::backward_pass(const float* d_dy_host_ptr, float lr)
 {
     const int BS = 256;
     dim3 block(BS);
