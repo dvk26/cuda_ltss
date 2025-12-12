@@ -1,11 +1,50 @@
 #include "gpu_autoencoder.hpp"
 #include <iostream>
 #include <cmath>
+#include <vector>
+#include <random>
+#include <fstream> // Cần thiết cho save_weights
 
 // ====================================================
 // KERNELS
 // ====================================================
 
+// [FIX] Thêm Kernel tính MSE Loss còn thiếu
+__global__ void mse_loss_kernel(
+    const float* __restrict__ pred,
+    const float* __restrict__ target,
+    float* __restrict__ dY,
+    float* __restrict__ loss_out,
+    int total_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ float s_loss[]; 
+    int tid = threadIdx.x;
+    s_loss[tid] = 0.0f;
+
+    if (idx < total_elements) {
+        float p = pred[idx];
+        float t = target[idx];
+        float diff = p - t;
+        // Gradient dY = 2/N * (P - T)
+        dY[idx] = (2.0f * diff) / (float)total_elements;
+        // Loss accumulation
+        s_loss[tid] = diff * diff;
+    }
+    __syncthreads();
+
+    // Reduction loss trong block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_loss[tid] += s_loss[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(loss_out, s_loss[0]);
+    }
+}
 
 // ====================================================
 // OPTIMIZED KERNELS (SHARED MEMORY)
@@ -34,10 +73,11 @@ __global__ void conv2d_forward_tiled_kernel(
     // Tọa độ đầu ra của block này
     int bx = blockIdx.x;
     int by = blockIdx.y;
-    int bz = blockIdx.z; // Batch index n
-
-    int n = bz;
-    int c_out = blockIdx.w; // Channel out (chúng ta sẽ grid.w = Cout)
+    
+    // [FIX] CUDA không có blockIdx.w. Ta phải map Z-axis = N * Cout
+    int total_z = blockIdx.z;
+    int c_out = total_z % Cout; // Channel out
+    int n     = total_z / Cout; // Batch index n
 
     int h_out = by * TILE_W + ty;
     int w_out = bx * TILE_W + tx;
@@ -51,10 +91,6 @@ __global__ void conv2d_forward_tiled_kernel(
     // Loop qua từng channel input
     for (int c = 0; c < Cin; ++c) {
         // 1. Load Input Tile vào Shared Memory
-        // Mỗi thread load logic: Mapping tuyến tính từ thread ID sang tile index
-        // Tile size: 18x18 = 324 elements. Block size: 16x16 = 256 threads.
-        // Cần loop để load hết.
-        
         int h_base = by * TILE_W - HALO_R;
         int w_base = bx * TILE_W - HALO_R;
 
@@ -99,17 +135,12 @@ __global__ void conv2d_forward_tiled_kernel(
 }
 
 // ---- 2. Conv2D Backward DATA (dX) - NO ATOMICS ----
-// Tính dX bằng cách gom gradient từ dY xung quanh (Gather)
-// Đây thực chất là một phép Convolution của dY với Weights (được lật)
 __global__ void conv2d_backward_data_tiled_kernel(
     const float* __restrict__ w,
     const float* __restrict__ dY,
     float* __restrict__ dX,
     int N, int Cin, int H, int W, int Cout)
 {
-    // Chúng ta tính dX[n, c_in, h, w]
-    // Cần sum(dY[n, c_out, h', w'] * W[c_out, c_in, kh, kw])
-    
     // Tương tự forward, dùng Shared Memory để cache dY
     __shared__ float s_dy[SM_W][SM_W];
 
@@ -117,8 +148,11 @@ __global__ void conv2d_backward_data_tiled_kernel(
     int ty = threadIdx.y;
     int bx = blockIdx.x;
     int by = blockIdx.y;
-    int bz = blockIdx.z; // n
-    int c_in = blockIdx.w; // c_in
+    
+    // [FIX] Map Z-axis = N * Cin (vì output là dX có Cin channels)
+    int total_z = blockIdx.z;
+    int c_in = total_z % Cin; 
+    int bz   = total_z / Cin; // batch index
 
     int h_in = by * TILE_W + ty;
     int w_in = bx * TILE_W + tx;
@@ -146,26 +180,9 @@ __global__ void conv2d_backward_data_tiled_kernel(
         __syncthreads();
 
         // Convolution "Gather"
-        // dX tại (h,w) nhận đóng góp từ dY tại (h+kh-1, w+kw-1)
-        // Lưu ý: index weight phải map ngược lại vì đây là correlation
-        // Công thức chuẩn: dX[h,w] += dY[h+i, w+j] * W[c_out, c_in, 1-i, 1-j] (với kernel 3x3, zero centered)
-        // Map sang 0..2: dY tại offset (kh-1), weight tại (2-kh)
-        
         if (h_in < H && w_in < W) {
             for (int kh = 0; kh < 3; ++kh) {
                 for (int kw = 0; kw < 3; ++kw) {
-                    // Lấy dY từ shared mem
-                    // Tại sao lại là [ty + (2-kh)][tx + (2-kw)]?
-                    // Đây là do phép lật kernel trong backward pass.
-                    // Tuy nhiên để đơn giản hoá tư duy:
-                    // Pixel Input(h,w) ảnh hưởng đến Output(h-1, w-1) qua Weight(2,2)
-                    // ... ảnh hưởng đến Output(h+1, w+1) qua Weight(0,0)
-                    // Nên ta cần lấy dY(h-1..h+1). 
-                    // Trong shared mem, dY đã load centered.
-                    // Weight index: [c_out, c_in, kh, kw]
-                    // dY offset tương ứng: (1-kh), (1-kw)
-                    // Shared mem index: ty + 1 + (1-kh) = ty + 2 - kh
-                    
                     int s_r = ty + 2 - kh;
                     int s_c = tx + 2 - kw;
                     
@@ -186,8 +203,6 @@ __global__ void conv2d_backward_data_tiled_kernel(
 }
 
 // ---- 3. Conv2D Backward FILTER (gW, gb) ----
-// Cái này khó bỏ atomicAdd mà không dùng buffer lớn hoặc GEMM.
-// Giữ lại atomic nhưng code gọn hơn để giảm register pressure.
 __global__ void conv2d_backward_filter_kernel(
     const float* __restrict__ x,
     const float* __restrict__ dY,
@@ -224,10 +239,6 @@ __global__ void conv2d_backward_filter_kernel(
         }
     }
 }
-
-// --- Giữ nguyên các kernel khác (ReLU, Pool, Upsample, Zero, SGD) ---
-// ... (Copy từ code cũ vào đây nếu chưa có) ...
-
 
 // ---- 3. ReLU forward / backward ----
 __global__ void relu_forward_kernel(float* x, int total)
@@ -481,6 +492,10 @@ void GPUAutoencoder::alloc_all()
     CUDA_CHECK(cudaMalloc(&d_dr1_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dc1_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dx_,  nchw_size(N_, 3,   H_,  W_)   * sizeof(float)));
+
+    // [FIX] Cấp phát 2 biến quan trọng bị thiếu
+    CUDA_CHECK(cudaMalloc(&d_dy_, nchw_size(N_, 3, H_, W_) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_loss_accum_, sizeof(float)));
 }
 
 void GPUAutoencoder::free_all()
@@ -506,6 +521,10 @@ void GPUAutoencoder::free_all()
     safe_free(d_dp2_); safe_free(d_dr2_); safe_free(d_dc2_);
     safe_free(d_dp1_); safe_free(d_dr1_); safe_free(d_dc1_);
     safe_free(d_dx_);
+    
+    // [FIX] Free 2 biến mới
+    safe_free(d_dy_);
+    safe_free(d_loss_accum_);
 }
 
 void GPUAutoencoder::init_weights_random()
@@ -537,16 +556,17 @@ void GPUAutoencoder::set_input(const Tensor& x_host)
     size_t sz = nchw_size(N_, 3, H_, W_);
     CUDA_CHECK(cudaMemcpy(d_x_, x_host.raw().data(), sz * sizeof(float), cudaMemcpyHostToDevice));
 }
+
 void launch_conv2d_tiled(
     const float* x, const float* w, const float* b, float* y,
     int N, int Cin, int H, int W, int Cout)
 {
     dim3 block(16, 16);
+    // [FIX] CUDA chỉ hỗ trợ 3 chiều Grid. Map Z-axis = N * Cout
     dim3 grid(
         (W + 15) / 16, 
         (H + 15) / 16, 
-        N, 
-        Cout
+        N * Cout
     );
     conv2d_forward_tiled_kernel<<<grid, block>>>(x, w, b, y, N, Cin, H, W, Cout);
     CUDA_CHECK(cudaGetLastError());
@@ -809,11 +829,11 @@ void launch_conv2d_backward(
     // 1. Tính dX (Dùng Tiled Kernel, không atomic)
     // Grid structure: (GridW, GridH, Batch, Cin) <-- Output là Cin
     dim3 block(16, 16);
+    // [FIX] Map Z-axis = N * Cin
     dim3 grid_data(
         (W + 15) / 16,
         (H + 15) / 16,
-        N,
-        Cin // Lưu ý: Loop output là Cin
+        N * Cin 
     );
     conv2d_backward_data_tiled_kernel<<<grid_data, block>>>(w, dY, dX, N, Cin, H, W, Cout);
     CUDA_CHECK(cudaGetLastError());
@@ -826,9 +846,8 @@ void launch_conv2d_backward(
     CUDA_CHECK(cudaGetLastError());
 }
 
-
-
-void GPUAutoencoder::backward_pass(const float* d_dy_, float lr)
+// [FIX] Sửa logic tham số truyền vào để xử lý trường hợp nullptr
+void GPUAutoencoder::backward_pass(const float* external_grad, float lr)
 {
     const int BS = 256;
     dim3 block(BS);
@@ -836,8 +855,13 @@ void GPUAutoencoder::backward_pass(const float* d_dy_, float lr)
     // dC5 = dY
     {
         int total = N_ * 3 * H_ * W_;
-        dim3 grid((total + BS - 1) / BS);
-        CUDA_CHECK(cudaMemcpy(d_dc5_, d_dy_, total * sizeof(float), cudaMemcpyHostToDevice));
+        if (external_grad != nullptr) {
+            // Nếu có gradient từ ngoài (vd: từ backward_and_update) -> Copy vào
+            CUDA_CHECK(cudaMemcpy(d_dc5_, external_grad, total * sizeof(float), cudaMemcpyHostToDevice));
+        } else {
+            // Nếu null (vd: từ train_step) -> Copy từ buffer nội bộ d_dy_
+            CUDA_CHECK(cudaMemcpy(d_dc5_, d_dy_, total * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
     }
 
     // Zero gradient buffers
@@ -995,39 +1019,43 @@ void GPUAutoencoder::backward_pass(const float* d_dy_, float lr)
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-void GPUAutoencoder::backward_and_update(const Tensor& dOut, float lr)
+// [FIX] Cập nhật hàm train_step để dùng mse_loss_kernel
+float GPUAutoencoder::train_step(const Tensor& x_host, float lr)
 {
-    if (dOut.N() != N_ || dOut.C() != 3 || dOut.H() != H_ || dOut.W() != W_) {
-        throw std::runtime_error("Gradient shape mismatch");
-    }
+    set_input(x_host);
+    forward_pass();
 
-    backward_pass(dOut.raw().data(), lr);
+    // Reset loss accumulation
+    CUDA_CHECK(cudaMemset(d_loss_accum_, 0, sizeof(float)));
+
+    int total = N_ * 3 * H_ * W_;
+    const int BS = 256;
+    
+    // Gọi kernel MSE để tính Loss và Gradient dY
+    mse_loss_kernel<<<(total + BS - 1) / BS, BS, BS * sizeof(float)>>>(
+        d_c5_, d_x_, d_dy_, d_loss_accum_, total
+    );
+
+    // Truyền nullptr để backward_pass biết dùng d_dy_ nội bộ
+    backward_pass(nullptr, lr);
+
+    float total_loss = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&total_loss, d_loss_accum_, sizeof(float), cudaMemcpyDeviceToHost));
+    
+    return total_loss / (float)total;
 }
 
-void GPUAutoencoder::save_weights(const std::string& path) const
+float GPUAutoencoder::compute_loss(const Tensor& x_host)
 {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-        std::cerr << "Failed to open " << path << " for writing\n";
-        return;
-    }
+    set_input(x_host);
+    forward_pass();
 
-    auto save_tensor = [&](float* d_ptr, size_t n) {
-        std::vector<float> h_buf(n);
-        CUDA_CHECK(cudaMemcpy(h_buf.data(), d_ptr, n * sizeof(float), cudaMemcpyDeviceToHost));
-        out.write(reinterpret_cast<const char*>(h_buf.data()), n * sizeof(float));
-    };
+    CUDA_CHECK(cudaMemset(d_loss_accum_, 0, sizeof(float)));
+    int total = N_ * 3 * H_ * W_;
+    const int BS = 256;
+    mse_loss_kernel<<<(total + BS - 1)/BS, BS, BS * sizeof(float)>>>(d_c5_, d_x_, d_dy_, d_loss_accum_, total);
 
-    save_tensor(d_w1_, 256 * 3 * 3 * 3);
-    save_tensor(d_b1_, 256);
-    save_tensor(d_w2_, 128 * 256 * 3 * 3);
-    save_tensor(d_b2_, 128);
-    save_tensor(d_w3_, 128 * 128 * 3 * 3);
-    save_tensor(d_b3_, 128);
-    save_tensor(d_w4_, 256 * 128 * 3 * 3);
-    save_tensor(d_b4_, 256);
-    save_tensor(d_w5_, 3 * 256 * 3 * 3);
-    save_tensor(d_b5_, 3);
-
-    out.close();
+    float total_loss;
+    CUDA_CHECK(cudaMemcpy(&total_loss, d_loss_accum_, sizeof(float), cudaMemcpyDeviceToHost));
+    return total_loss / (float)total;
 }
