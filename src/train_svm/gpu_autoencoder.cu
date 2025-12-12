@@ -3,7 +3,7 @@
 #include <cmath>
 #include <vector>
 #include <random>
-
+#include <fstream>
 // ====================================================
 // 1. ĐỊNH NGHĨA KERNEL (DEVICE CODE)
 // ====================================================
@@ -779,4 +779,40 @@ Tensor GPUAutoencoder::decode(const Tensor& z_host) {
     Tensor output(N_, 3, H_, W_);
     CUDA_CHECK(cudaMemcpy(output.raw().data(), d_c5_, nchw_size(N_,3,H_,W_)*sizeof(float), cudaMemcpyDeviceToHost));
     return output;
+}
+
+// Thêm đoạn này vào gpu_autoencoder.cu
+
+void GPUAutoencoder::load_weights(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Failed to open weights file for loading: " + path);
+    }
+
+    // Helper: Đọc từ file vào vector CPU -> Copy xuống GPU
+    auto load_tensor = [&](float* d_ptr, size_t n) {
+        std::vector<float> h_buf(n);
+        in.read(reinterpret_cast<char*>(h_buf.data()), n * sizeof(float));
+        
+        if (!in) {
+            throw std::runtime_error("Error reading data from file (unexpected EOF?)");
+        }
+        
+        CUDA_CHECK(cudaMemcpy(d_ptr, h_buf.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    };
+
+    // Thứ tự phải khớp 100% với hàm save_weights
+    load_tensor(d_w1_, 256 * 3 * 3 * 3);
+    load_tensor(d_b1_, 256);
+    load_tensor(d_w2_, 128 * 256 * 3 * 3);
+    load_tensor(d_b2_, 128);
+    load_tensor(d_w3_, 128 * 128 * 3 * 3);
+    load_tensor(d_b3_, 128);
+    load_tensor(d_w4_, 256 * 128 * 3 * 3);
+    load_tensor(d_b4_, 256);
+    load_tensor(d_w5_, 3 * 256 * 3 * 3);
+    load_tensor(d_b5_, 3);
+
+    in.close();
+    std::cout << "Successfully loaded weights from " << path << "\n";
 }

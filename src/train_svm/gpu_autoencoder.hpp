@@ -51,6 +51,7 @@ public:
     void backward_and_update(const Tensor& dOut, float lr);
 
     void save_weights(const std::string& path) const;
+    void load_weights(const std::string& path);
 
 private:
     int N_;        // batch size
