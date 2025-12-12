@@ -96,39 +96,61 @@ __global__ void conv2d_forward_tiled_kernel(
 
 
 __global__ void conv2d_forward_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ w,
-    const float* __restrict__ b,
-    float* __restrict__ y,
+    const float* __restrict__ x,    // Input feature map với kích thước (N, Cin, H, W)
+    const float* __restrict__ w,    // Trọng số bên trong filter với kích thước (Cout, Cin, 3, 3)
+    const float* __restrict__ b,    // Vector chứa bias cho mỗi output channel
+    float* __restrict__ y,          // Output feature map (N, Cout, H, W)
     int N, int Cin, int H, int W, int Cout)
 {
+    // Tính global index cho thread hiện tại
+    // Global index của thread cũng chính là 1D index của phần tử
+    // trên feature map mà thread này phụ trách -- y[idx]
+    // Nói ngắn gọn: thread này phụ trách phần tử y[idx]
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Số lượng con số trong output feature map
     int total = N * Cout * H * W;
+
     if (idx >= total) return;
 
-    int w_out = idx % W;
+    // Từ global index của thread này, xác định vị trí của output cell
+    // mà nó sẽ tính toán
+    // output cell nằm trên feature map là một tensor 4D
+    int w_out = idx % W;    // Cột số mấy
     int tmp = idx / W;
-    int h_out = tmp % H;
+    int h_out = tmp % H;    // Dòng số mấy
     tmp /= H;
-    int c_out = tmp % Cout;
-    int n = tmp / Cout;
+    int c_out = tmp % Cout; // Channel nào của bức ảnh đó
+    int n = tmp / Cout;     // Bức ảnh thứ mấy trong batch
 
-    float sum = b[c_out];
+    float sum = b[c_out];   // Khởi tạo tổng đầu ra của phép convolution bằng giá trị bias
+                            // tại channel này
 
+    // Lặp qua tất cả các channel của input feature map
     for (int c = 0; c < Cin; ++c) {
+        // Với mỗi channel, lặp qua từng dòng của filter
         for (int kh = -1; kh <= 1; ++kh) {
+            // Với mỗi dòng của filter, lặp qua từng cột của dòng đó
             for (int kw = -1; kw <= 1; ++kw) {
+                // Xét phần tử tại dòng kh cột kw của filter
+                // Tính phần tử input tương ứng với nó
                 int ih = h_out + kh;
                 int iw = w_out + kw;
+
+                // Nếu phần tử input bị out-of-bound thì không cần tính
                 if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
 
-                int x_idx = ((n * Cin + c) * H + ih) * W + iw;
-                int k_idx = (((c_out * Cin + c) * 3 + (kh + 1)) * 3 + (kw + 1));
+                // Do input feature map và filter đều được lưu dưới dạng mảng 1D
+                int x_idx = ((n * Cin + c) * H + ih) * W + iw;  // Index 1D của phần tử input
+                int k_idx = (((c_out * Cin + c) * 3 + (kh + 1)) * 3 + (kw + 1));    // Index 1D của phần tử filter
+                
+                // Cập nhật tổng đầu ra của phép convolution
                 sum += x[x_idx] * w[k_idx];
             }
         }
     }
 
+    // Gán tổng đầu ra vào phần tử output mà thread này phụ trách
     y[idx] = sum;
 }
 
@@ -142,44 +164,70 @@ __global__ void conv2d_forward_kernel(
 __global__ void conv2d_backward_kernel(
     const float* __restrict__ x,
     const float* __restrict__ w,
-    const float* __restrict__ dY,
-    float* __restrict__ dX,
-    float* __restrict__ gW,
-    float* __restrict__ gb,
+    const float* __restrict__ dY,   // Gradient của hàm loss theo output của layer này          -- kích thước: (N, Cout, H, W)
+    float* __restrict__ dX,         // Gradient của hàm loss theo input của layer này           -- kích thước: (N, Cin, H, W)
+    float* __restrict__ gW,         // Gradient của hàm loss theo trọng số filter của layer này -- kích thước: (Cout, Cin, 3, 3)
+    float* __restrict__ gb,         // Gradient của hàm loss theo bias của layer này            -- kích thước: (Cout)
     int N, int Cin, int H, int W, int Cout)
 {
+    // Hàm này được dùng để tính 3 thứ:
+    // + gW là gradient của loss theo filter weight.
+    // + dB là gradient của loss theo bias.
+    // + dX là gradient của loss theo input feature map.
+    // Các giá trị này được tính toán dựa trên dY.
+    // Các phần tử trong dY đã được tính toán trong backward của layer kế tiếp.
+
+    // Thread này sẽ phụ trách phần tử `idx` trên tensor dY.
+    // Thread này sẽ sử dụng phần tử `idx` này để tính toán 3 đối tượng bên trên.
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Số lượng phần tử trên tensor dY -- gradient của hàm loss theo đầu ra của layer này
     int total = N * Cout * H * W;
+
     if (idx >= total) return;
 
-    int w_out = idx % W;
+    // Từ 1D index, tính toán 4D index trên tensor dY
+    int w_out = idx % W;        // Cột nào
     int tmp = idx / W;
-    int h_out = tmp % H;
+    int h_out = tmp % H;        // Dòng nào
     tmp /= H;
     int c_out = tmp % Cout;
-    int n = tmp / Cout;
+    int n = tmp / Cout;         // Ảnh thứ mấy
 
-    float grad_out = dY[idx];
+    float grad_out = dY[idx];   // Lấy ra partial derivative của loss trên phần tử `idx` của output layer kế tiếp
 
-    // bias grad
+    // Gradient của hàm loss theo một channel bias
+    // là tổng của các gradient của loss theo từng output đầu ra trên channel đó
     atomicAdd(&gb[c_out], grad_out);
 
+    // Duyệt qua từng channel
     for (int c = 0; c < Cin; ++c) {
+        // Đối với mỗi channel, duyệt của từng dòng của filter ứng với channel đó
         for (int kh = -1; kh <= 1; ++kh) {
+            // Đối với mỗi dòng, duyệt qua từng cột
             for (int kw = -1; kw <= 1; ++kw) {
+                // Xét phần tử filter tại channel c, dòng kh, cột kw
+
+                // Tính chỉ số của input tương ứng với phần tử filter đó
                 int ih = h_out + kh;
                 int iw = w_out + kw;
-                if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
 
+                if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
+                
+                // Tính 1D index cho input vừa tìm được
                 int x_idx = ((n * Cin + c) * H + ih) * W + iw;
+
+                // Tính 1D index cho phần tử filter đang xét
                 int k_idx = (((c_out * Cin + c) * 3 + (kh + 1)) * 3 + (kw + 1));
 
+                // Lấy ra giá trị từ mỗi mảng bằng các index vừa tính được
                 float x_val = x[x_idx];
                 float w_val = w[k_idx];
-
-                // dW
+                
+                // Tính và cộng dồn gradient của loss theo input vừa tìm được
                 atomicAdd(&gW[k_idx], grad_out * x_val);
-                // dX
+                
+                // Tính và cộng dồn gradient của loss theo phần tử filter đang xét
                 atomicAdd(&dX[x_idx], grad_out * w_val);
             }
         }

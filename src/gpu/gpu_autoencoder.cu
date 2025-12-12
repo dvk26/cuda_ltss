@@ -337,7 +337,7 @@ GPUAutoencoder::GPUAutoencoder(int batch_size, int H, int W)
     H1_ = H_ / 2; W1_ = W_ / 2;     // after Pool1
     H2_ = H1_ / 2; W2_ = W1_ / 2;   // after Pool2
     alloc_all();
-    init_weights_random();
+    init_weights_random();          // TODO: Implement Xavier-Glorot initialization
 }
 
 GPUAutoencoder::~GPUAutoencoder()
