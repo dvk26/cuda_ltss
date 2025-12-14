@@ -1,45 +1,46 @@
 #include "../include/dataset.hpp"
 #include "gpu_autoencoder.hpp"
-#include "svm.h" // File header của LIBSVM
+#include "svm.h"
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <chrono> 
+#include <iomanip> 
 
-// Cấu hình theo đề bài
+// Cấu hình
 const int LATENT_DIM = 128 * 8 * 8; // 8192 features
 const int BATCH_SIZE = 64;
 
-// Hàm helper để chuyển vector float sang định dạng svm_node của LIBSVM
+// Helper struct
 struct SVMData {
     svm_problem prob;
-    std::vector<svm_node*> x_space; // Con trỏ mảng feature cho từng mẫu
-    std::vector<double> y_space;    // Label
-    std::vector<svm_node> data_pool; // Bộ nhớ thực chứa dữ liệu
+    std::vector<svm_node*> x_space;
+    std::vector<double> y_space;
+    std::vector<svm_node> data_pool;
 };
 
-// Trích xuất đặc trưng từ Autoencoder
+// Hàm trích xuất đặc trưng
 void extract_features(GPUAutoencoder& ae, DataLoader& loader, 
                       std::vector<std::vector<float>>& out_features, 
-                      std::vector<int>& out_labels) {
-    loader.reset(false); // Không shuffle để giữ thứ tự nếu cần kiểm tra
+                      std::vector<int>& out_labels,
+                      const std::string& phase_name) {
+    loader.reset(false);
     int count = 0;
     
-    std::cout << "Extracting features..." << std::endl;
+    std::cout << "[" << phase_name << "] Start extracting features..." << std::endl;
+    auto start = std::chrono::high_resolution_clock::now();
 
     while (loader.has_next()) {
         auto batch = loader.next();
-        Tensor& img = batch.images; // [N, 3, 32, 32]
+        Tensor& img = batch.images; 
         
-        if (img.N() != BATCH_SIZE) continue; // Bỏ qua batch lẻ (do GPU code fix cứng size)
+        if (img.N() != BATCH_SIZE) continue; 
 
-        // 1. Chạy Encode trên GPU
-        Tensor latent = ae.encode(img); // [N, 128, 8, 8]
-
-        // 2. Chép về CPU và Flatten
+        Tensor latent = ae.encode(img); 
         const float* raw_data = latent.raw().data();
+
         for (int i = 0; i < BATCH_SIZE; ++i) {
             std::vector<float> vec(LATENT_DIM);
-            // Copy 8192 float cho ảnh thứ i
             std::copy(raw_data + i * LATENT_DIM, 
                       raw_data + (i + 1) * LATENT_DIM, 
                       vec.begin());
@@ -49,12 +50,16 @@ void extract_features(GPUAutoencoder& ae, DataLoader& loader,
         }
         
         count += BATCH_SIZE;
-        if (count % 1000 == 0) std::cout << "Processed " << count << " images...\r" << std::flush;
+        if (count % 5000 == 0) std::cout << "  Processed " << count << " images...\r" << std::flush;
     }
-    std::cout << "\nExtraction done. Total: " << out_features.size() << "\n";
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    
+    std::cout << "\n[" << phase_name << "] Done. Count: " << out_features.size() 
+              << " | Time: " << std::fixed << std::setprecision(2) << elapsed.count() << "s" << std::endl;
 }
 
-// Chuẩn bị dữ liệu cho LIBSVM
 SVMData prepare_libsvm_data(const std::vector<std::vector<float>>& features, 
                             const std::vector<int>& labels) {
     SVMData dataset;
@@ -63,9 +68,7 @@ SVMData prepare_libsvm_data(const std::vector<std::vector<float>>& features,
     dataset.y_space.resize(N);
     dataset.x_space.resize(N);
 
-    // LIBSVM dùng sparse format: index:value. Kết thúc bằng index = -1.
-    // Vì feature dense (8192 chiều), ta cần (8192 + 1) node cho mỗi ảnh.
-    // Tổng số node cần cấp phát: N * (LATENT_DIM + 1)
+    // Cấp phát bộ nhớ cho toàn bộ các node
     size_t total_nodes = (size_t)N * (LATENT_DIM + 1);
     dataset.data_pool.resize(total_nodes);
 
@@ -75,11 +78,10 @@ SVMData prepare_libsvm_data(const std::vector<std::vector<float>>& features,
         dataset.x_space[i] = &dataset.data_pool[pool_idx];
 
         for (int j = 0; j < LATENT_DIM; ++j) {
-            dataset.data_pool[pool_idx].index = j + 1; // LIBSVM index start from 1
+            dataset.data_pool[pool_idx].index = j + 1;
             dataset.data_pool[pool_idx].value = features[i][j];
             pool_idx++;
         }
-        // Node kết thúc
         dataset.data_pool[pool_idx].index = -1;
         pool_idx++;
     }
@@ -97,13 +99,16 @@ int main(int argc, char** argv) {
     std::string cifar_dir = argv[1];
     std::string weights_path = argv[2];
 
+    auto total_start = std::chrono::high_resolution_clock::now();
+
     // 1. Load Dataset
+    std::cout << "Loading dataset..." << std::endl;
     CIFAR10 ds;
     ds.load(cifar_dir, false);
     DataLoader train_loader(ds.train_images(), ds.train_labels(), BATCH_SIZE, false);
     DataLoader test_loader(ds.test_images(), ds.test_labels(), BATCH_SIZE, false);
 
-    // 2. Load Autoencoder & Weights
+    // 2. Load AE
     GPUAutoencoder ae(BATCH_SIZE, 32, 32);
     try {
         ae.load_weights(weights_path);
@@ -112,25 +117,60 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 3. Extract Features (Train Set)
+    // ---------------------------------------------------------
+    // 3. Extract Train Features
+    // ---------------------------------------------------------
     std::vector<std::vector<float>> train_feats;
     std::vector<int> train_labels;
-    extract_features(ae, train_loader, train_feats, train_labels);
+    extract_features(ae, train_loader, train_feats, train_labels, "TRAIN-SET");
 
-    // 4. Prepare SVM Data
-    std::cout << "Preparing SVM training data format...\n";
+    // ---------------------------------------------------------
+    // 4. Min-Max Scaling Logic
+    // ---------------------------------------------------------
+    std::cout << "Computing Scaling Parameters (Min-Max)..." << std::endl;
+    std::vector<float> max_val(LATENT_DIM, -1e9), min_val(LATENT_DIM, 1e9);
+
+    // Tính min/max dựa trên tập TRAIN
+    for(const auto& vec : train_feats) {
+        for(int j=0; j<LATENT_DIM; ++j) {
+            if(vec[j] > max_val[j]) max_val[j] = vec[j];
+            if(vec[j] < min_val[j]) min_val[j] = vec[j];
+        }
+    }
+
+    // Lambda hàm scale
+    auto scale_data = [&](std::vector<std::vector<float>>& data) {
+        for(auto& vec : data) {
+            for(int j=0; j<LATENT_DIM; ++j) {
+                float range = max_val[j] - min_val[j];
+                if(range > 1e-6) 
+                    vec[j] = (vec[j] - min_val[j]) / range; // Scale về [0, 1]
+                else 
+                    vec[j] = 0.0f;
+            }
+        }
+    };
+
+    // Áp dụng scale cho TRAIN ngay lập tức
+    scale_data(train_feats);
+
+    // ---------------------------------------------------------
+    // 5. Train SVM
+    // ---------------------------------------------------------
+    std::cout << "Converting to LIBSVM sparse format..." << std::endl;
+    auto t_prep_start = std::chrono::high_resolution_clock::now();
     SVMData train_data = prepare_libsvm_data(train_feats, train_labels);
+    std::cout << "Conversion time: " << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_prep_start).count() << "s\n";
 
-    // 5. Setup SVM Parameters (Theo yêu cầu PDF)
     svm_parameter param;
     param.svm_type = C_SVC;
-    param.kernel_type = RBF;    // Radial Basis Function
+    param.kernel_type = RBF;
     param.degree = 3;
-    param.gamma = 1.0 / LATENT_DIM; // gamma = auto (1/num_features)
+    param.gamma = 1.0 / LATENT_DIM; 
     param.coef0 = 0;
     param.nu = 0.5;
-    param.cache_size = 2000;    // MB RAM cho cache kernel (quan trọng để chạy nhanh)
-    param.C = 10;               // C = 10 theo đề bài
+    param.cache_size = 2000; // 2GB Cache
+    param.C = 10; 
     param.eps = 1e-3;
     param.p = 0.1;
     param.shrinking = 1;
@@ -139,29 +179,43 @@ int main(int argc, char** argv) {
     param.weight_label = NULL;
     param.weight = NULL;
 
-    // 6. Train SVM
-    std::cout << "Training SVM (This may take a while)..." << std::endl;
-    // Tắt log của libsvm để đỡ rối (optional)
-    // svm_set_print_string_function(NULL); 
+    std::cout << "Training SVM (RBF Kernel)..." << std::endl;
+    auto t_train_start = std::chrono::high_resolution_clock::now();
     
     svm_model* model = svm_train(&train_data.prob, &param);
-    std::cout << "SVM Training Completed.\n";
+    
+    std::cout << "SVM Training time: " << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_train_start).count() << "s\n";
 
-    // 7. Evaluate on Test Set
-    std::cout << "Extracting Test Features...\n";
+
+    const char* model_filename = "cifar10_svm.model";
+    if (svm_save_model(model_filename, model) == 0) {
+        std::cout << "Saved SVM model to " << model_filename << "\n";
+    } else {
+        std::cerr << "Failed to save SVM model.\n";
+    }
+
+    // ---------------------------------------------------------
+    // 6. Extract & Scale Test Features
+    // ---------------------------------------------------------
     std::vector<std::vector<float>> test_feats;
     std::vector<int> test_labels;
-    extract_features(ae, test_loader, test_feats, test_labels);
+    // Extract xong mới được scale
+    extract_features(ae, test_loader, test_feats, test_labels, "TEST-SET");
+    
+    std::cout << "Scaling Test Data using Train parameters..." << std::endl;
+    scale_data(test_feats); // [QUAN TRỌNG] Scale tập test bằng min/max của train
 
-    std::cout << "Evaluating...\n";
+    // ---------------------------------------------------------
+    // 7. Evaluate
+    // ---------------------------------------------------------
+    std::cout << "Evaluating accuracy..." << std::endl;
+    auto t_eval_start = std::chrono::high_resolution_clock::now();
+    
     int correct = 0;
     int total = test_feats.size();
-    
-    // Buffer tạm để dự đoán từng mẫu
     std::vector<svm_node> test_nodes(LATENT_DIM + 1);
 
     for (int i = 0; i < total; ++i) {
-        // Convert single vector to svm_node
         for (int j = 0; j < LATENT_DIM; ++j) {
             test_nodes[j].index = j + 1;
             test_nodes[j].value = test_feats[i][j];
@@ -169,16 +223,17 @@ int main(int argc, char** argv) {
         test_nodes[LATENT_DIM].index = -1;
 
         double pred = svm_predict(model, test_nodes.data());
-        if ((int)pred == test_labels[i]) {
-            correct++;
-        }
+        if ((int)pred == test_labels[i]) correct++;
     }
 
     float acc = 100.0f * correct / total;
-    std::cout << "Test Accuracy: " << acc << "% (Expected 60-65%)\n";
+    auto total_end = std::chrono::high_resolution_clock::now();
 
-    // Cleanup
+    std::cout << "------------------------------------------------\n";
+    std::cout << "Total Runtime:   " << std::chrono::duration<double>(total_end - total_start).count() << "s\n";
+    std::cout << "TEST ACCURACY:   " << acc << "%\n";
+    std::cout << "------------------------------------------------\n";
+
     svm_free_and_destroy_model(&model);
-    
     return 0;
 }
