@@ -155,7 +155,17 @@ int main(int argc, char** argv) {
     scale_data(train_feats);
 
     // ---------------------------------------------------------
-    // 5. Train SVM
+    // 5. Extract & Scale Test Features
+    // ---------------------------------------------------------
+    std::vector<std::vector<float>> test_feats;
+    std::vector<int> test_labels;
+    // Extract xong mới được scale
+    extract_features(ae, test_loader, test_feats, test_labels, "TEST-SET");
+    std::cout << "Scaling Test Data using Train parameters..." << std::endl;
+    scale_data(test_feats); // [QUAN TRỌNG] Scale tập test bằng min/max của train
+
+    // ---------------------------------------------------------
+    // 6. Train SVM
     // ---------------------------------------------------------
     std::cout << "Converting to LIBSVM sparse format..." << std::endl;
     auto t_prep_start = std::chrono::high_resolution_clock::now();
@@ -194,16 +204,7 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to save SVM model.\n";
     }
 
-    // ---------------------------------------------------------
-    // 6. Extract & Scale Test Features
-    // ---------------------------------------------------------
-    std::vector<std::vector<float>> test_feats;
-    std::vector<int> test_labels;
-    // Extract xong mới được scale
-    extract_features(ae, test_loader, test_feats, test_labels, "TEST-SET");
     
-    std::cout << "Scaling Test Data using Train parameters..." << std::endl;
-    scale_data(test_feats); // [QUAN TRỌNG] Scale tập test bằng min/max của train
 
     // ---------------------------------------------------------
     // 7. Evaluate
