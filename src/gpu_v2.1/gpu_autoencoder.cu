@@ -30,14 +30,16 @@ __global__ void conv2d_forward_tiled_kernel(
     int tx = threadIdx.x; // 0 .. TILE_W+1
     int ty = threadIdx.y; // 0 .. TILE_H+1
 
-    // Góc trái trên của tile output mà block này xử lý
+    // Góc trái trên -- a.k.a pixel đầu tiên -- của tile output mà block này xử lý
     int out_x0 = blockIdx.x * TILE_W;
     int out_y0 = blockIdx.y * TILE_H;
 
     // blockIdx.z gộp (n, c_out)
+    // Gộp "số lượng tấm ảnh" và "số lượng output channel" vào 1 dimension để đơn giản hoá grid
     int nc    = blockIdx.z;
     int c_out = nc % Cout;
     int n     = nc / Cout;
+
     if (n >= N) return;
 
     extern __shared__ float s[]; // kích thước = Cin * SH_H * SH_W
@@ -45,16 +47,26 @@ __global__ void conv2d_forward_tiled_kernel(
     // ================================
     // 1) Load tile input (kèm halo) vào shared memory
     // ================================
+    // Tính toán global indices của thread hiện tại
     int gx = out_x0 + tx - 1; // toạ độ global tương ứng (có trừ 1 để lấy halo)
     int gy = out_y0 + ty - 1;
 
+    // Duyệt qua từng channel
     for (int c = 0; c < Cin; ++c) {
+        // Đối với mỗi channel, lấy ra giá trị input mà thread này handle tại channel đó
+        // rồi lưu vào shared mem.
         float v = 0.f;
-        if (gx >= 0 && gx < W && gy >= 0 && gy < H) {
+        if (gx >= 0 && gx < W && gy >= 0 && gy < H) {   // Kiểm tra global indices có lố ra ngoài kích thước tấm ảnh hay không
+            // Tính 1D index của phần tử input tại channel c 
+            // tương ứng với global indices của thread hiện tại
             int x_idx = ((n * Cin + c) * H + gy) * W + gx;
             v = x[x_idx];
         }
+
+        // Tính index trên shared mem của block, nơi mà ta lưu phần tử input này
         size_t idx_s = ((size_t)c * SH_H + ty) * SH_W + tx;
+
+        // Lưu vào shared mem
         s[idx_s] = v;
     }
     __syncthreads();
