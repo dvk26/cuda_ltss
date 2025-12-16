@@ -48,3 +48,16 @@ model.fit(X_train_scaled, y_train)
 # Đánh giá
 acc = model.score(X_test_scaled, y_test)
 print(f"Test Accuracy: {acc * 100:.2f}%")
+
+import pickle
+import os
+
+os.makedirs('out', exist_ok=True)
+
+with open('out/svm_model.pkl', 'wb') as f:
+    pickle.dump(model, f)
+
+with open('out/scaler.pkl', 'wb') as f:
+    pickle.dump(scaler, f)
+
+print("Model & scaler saved.")
