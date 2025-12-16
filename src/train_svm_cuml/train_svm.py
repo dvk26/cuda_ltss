@@ -28,8 +28,8 @@ def load_features_bin(filename):
     return X, y
 
 # --- SỬ DỤNG ---
-X_train, y_train = load_features_bin('train_features.bin')
-X_test, y_test = load_features_bin('test_features.bin')
+X_train, y_train = load_features_bin('../../train_features.bin')
+X_test, y_test = load_features_bin('../../test_features.bin')
 
 # --- CHẠY CUML SVM ---
 from cuml.svm import SVC
