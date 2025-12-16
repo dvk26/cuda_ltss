@@ -39,23 +39,22 @@ void extract_and_save(GPUAutoencoder& ae, DataLoader& loader, const std::string&
         // Bỏ qua batch lẻ không đủ size (do GPU code fix cứng size)
         if (img.N() != BATCH_SIZE) continue;
 
-        // --- GPU Inference ---
-        Tensor latent = ae.encode(img);
+                // --- GPU Inference ---
+        Tensor latent = ae.encode(img);  // encode() đã copy về CPU rồi
         
-        // Copy từ GPU về CPU
-        std::vector<float> batch_features(BATCH_SIZE * LATENT_DIM);
-        cudaMemcpy(batch_features.data(), latent.raw().data(), 
-                   batch_features.size() * sizeof(float), cudaMemcpyDeviceToHost);
-
+        // latent.raw().data() là con trỏ CPU, dùng trực tiếp luôn
+        const float* latent_data = latent.raw().data();
+        
         // --- Ghi xuống file ---
         for (int i = 0; i < BATCH_SIZE; ++i) {
-            // 1. Ghi Label (int)
+            // 1. Ghi label
             int label = batch.labels[i];
             outfile.write(reinterpret_cast<const char*>(&label), sizeof(int));
-
-            // 2. Ghi Feature Vector (float array)
-            const float* feature_ptr = &batch_features[i * LATENT_DIM];
-            outfile.write(reinterpret_cast<const char*>(feature_ptr), LATENT_DIM * sizeof(float));
+        
+            // 2. Ghi feature vector
+            const float* feature_ptr = latent_data + i * LATENT_DIM;
+            outfile.write(reinterpret_cast<const char*>(feature_ptr),
+                          LATENT_DIM * sizeof(float));
         }
 
         total_samples += BATCH_SIZE;
