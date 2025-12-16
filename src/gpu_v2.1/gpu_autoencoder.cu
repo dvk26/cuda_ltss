@@ -15,7 +15,6 @@
 #define TILE_H 16
 #define TILE_W 16
 
-
 __global__ void conv2d_forward_tiled_kernel(
     const float* __restrict__ x,
     const float* __restrict__ w,
@@ -105,7 +104,6 @@ __global__ void conv2d_forward_tiled_kernel(
     
     y[y_idx] = sum;
 }
-
 
 __global__ void conv2d_forward_kernel(
     const float* __restrict__ x,    // Input feature map với kích thước (N, Cin, H, W)
@@ -206,10 +204,11 @@ __global__ void conv2d_backward_kernel(
     int c_out = tmp % Cout;
     int n = tmp / Cout;         // Ảnh thứ mấy
 
-    float grad_out = dY[idx];   // Lấy ra partial derivative của loss trên phần tử `idx` của output layer kế tiếp
+    float grad_out = dY[idx];   // Lấy ra partial derivative của loss trên phần tử `idx` của output (của layer này)
 
     // Gradient của hàm loss theo một channel bias
-    // là tổng của các gradient của loss theo từng output đầu ra trên channel đó
+    // là tổng của nhiều hạng tử với mỗi hạng tử là
+    // một đạo hàm riêng của loss theo một output đầu ra cụ thể trên channel đó
     atomicAdd(&gb[c_out], grad_out);
 
     // Duyệt qua từng channel
@@ -233,18 +232,24 @@ __global__ void conv2d_backward_kernel(
                 int k_idx = (((c_out * Cin + c) * 3 + (kh + 1)) * 3 + (kw + 1));
 
                 // Lấy ra giá trị từ mỗi mảng bằng các index vừa tính được
-                float x_val = x[x_idx];
-                float w_val = w[k_idx];
+                float x_val = x[x_idx];     // Lấy giá trị input từ mảng input
+                float w_val = w[k_idx];     // Lấy giá trị filter từ mảng filter
                 
-                // Tính và cộng dồn gradient của loss theo input vừa tìm được
+                // Gradient của loss theo 1 cell trong filter (1 biến)
+                // bằng tổng của các tích giữa dY và phần tử input tương ứng
+                // với filter cell đó.
                 atomicAdd(&gW[k_idx], grad_out * x_val);
                 
-                // Tính và cộng dồn gradient của loss theo phần tử filter đang xét
+                // Gradient của loss theo 1 cell trong input (1 biến)
+                // bằng tổng của các tích giữa dY và phần tử filter tương ứng
+                // với input cell đó.
                 atomicAdd(&dX[x_idx], grad_out * w_val);
             }
         }
     }
 }
+
+
 
 // ---- 3. ReLU forward / backward (in-place-style) ----
 __global__ void relu_forward_kernel(float* x, int total)
