@@ -1,4 +1,4 @@
-## **description: Document CUDA C codebase as-is with thoughts**
+## **description: Document CUDA C codebase as-is with documents/**
 
 # **Research CUDA C Codebase**
 
@@ -34,7 +34,7 @@ Then wait for the user's research query.
      * **Host-Side Control**: Memory allocation, data movement, kernel configuration  
      * **Device-Side Logic**: Thread hierarchy, math operations, shared memory usage  
      * **Build System**: NVCC flags, linking, library dependencies  
-   * Create a research plan using TodoWrite to track all research steps  
+   * Create a research plan (use `update_plan`) to track all research steps  
 3. **Conduct comprehensive research using your tools:**  
    * Systematically investigate the codebase using search and read tools.
 
@@ -55,10 +55,12 @@ Then wait for the user's research query.
    * Look for reduction patterns, tiling strategies, and stream pipelining  
    * Look for macro usage for error checking (e.g., cudaCheckError)
 
-   **IMPORTANT**: You are a documentarian. If you see inefficient global memory access, you must describe *how it accesses memory*, not that it is slow.**Search Historical Context (Thoughts):**
+   **IMPORTANT**: You are a documentarian. If you see inefficient global memory access, you must describe *how it accesses memory*, not that it is slow.
 
-   * Search the thoughts/ directory to discover existing documentation or benchmarks  
-   * specific documents to understand *why* certain grid/block sizes were chosen
+   **Search Historical Context (documents/):**
+
+   * Search the `documents/` directory to discover existing research notes, plans, and benchmarks  
+   * Read relevant docs to understand *why* certain grid/block sizes were chosen
 
    **Web Research (only if user explicitly asks):**
 
@@ -76,11 +78,11 @@ Then wait for the user's research query.
      * git rev-parse HEAD (for git\_commit)  
      * git branch \--show-current (for branch)  
      * git config user.name (for last\_updated\_by fallback)  
-   * **Filename Generation**: thoughts/shared/research/YYYY-MM-DD-ENG-XXXX-description.md  
-     * YYYY-MM-DD is today's date  
-     * ENG-XXXX is the ticket number (omit if no ticket)  
-     * description is a brief kebab-case description of the research topic  
-     * Example: 2025-01-08-matrix-multiplication-kernels.md  
+   * **Filename Generation (documents/ structure)**:
+     * Create (or reuse) a date folder: `documents/MM-DD-YYYY/`
+     * Put research notes under: `documents/MM-DD-YYYY/researches/`
+     * Use a descriptive filename such as: `research-<kebab-case-topic>.md`
+     * Example: `documents/01-08-2025/researches/research-matrix-multiplication-kernels.md`
 6. **Generate research document:**  
    * Use the metadata gathered in step 5  
    * Structure the document with YAML frontmatter followed by content:  
@@ -135,8 +137,8 @@ Then wait for the user's research query.
      \#\# Architecture Documentation  
      \[Current patterns: e.g., "The system uses a producer-consumer pattern with CUDA Streams"\]
 
-     \#\# Historical Context (from thoughts/)  
-     \[Relevant insights from thoughts/ directory\]
+     \#\# Historical Context (from documents/)  
+     \[Relevant insights from `documents/` directory\]
 
      \#\# Open Questions  
      \[Any ambiguities in the data flow or thread indexing\]
@@ -146,14 +148,14 @@ Then wait for the user's research query.
    * If on main/master or pushed, generate GitHub permalinks  
    * Replace local file references with permalinks in the document  
 8. **Sync and present findings:**  
-   * Run humanlayer thoughts sync to sync the thoughts directory  
+   * Ensure the research note is saved under `documents/MM-DD-YYYY/researches/`  
    * Present a concise summary of findings to the user  
    * Ask if they need clarification on specific kernels or memory flows  
 9. **Handle follow-up questions:**  
    * If the user has follow-up questions, append to the same research document  
    * Update frontmatter and add \#\# Follow-up Research \[timestamp\]  
    * Perform additional research as needed  
-   * Continue updating the document and syncing
+   * Continue updating the document
 
 ## **Important notes:**
 
@@ -163,6 +165,4 @@ Then wait for the user's research query.
 * **Dimensions**: Always document Grid and Block dimensions if they are static/hardcoded  
 * **No Evaluation**: Describe *what* the code does (e.g., "Thread 0 writes to global memory"), not *how well* it does it  
 * **Context**: Remember that \_\_global\_\_ functions are entry points, and \_\_device\_\_ functions are internal helpers  
-* **Path handling**: The thoughts/searchable/ directory contains hard links for searching  
-  * Always document paths by removing ONLY "searchable/"  
 * **Critical ordering**: Follow the numbered steps exactly

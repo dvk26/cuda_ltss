@@ -1,5 +1,5 @@
 research and create a detailed implementation plan to implement  
-`research_documents/12-16-2025/research_mixed_precision_and_checkpointing.md`  
+`documents/12-16-2025/researches/research-matrix-multiplication-kernels.md`  
 and report to me using this format in Markdown.
 
 ---
@@ -24,4 +24,8 @@ Which approach aligns best with your vision?
 
 Place your findings under:
 
-`research_documents/12-16-2025/`
+`documents/12-16-2025/plans/`
+
+Example filename:
+
+`documents/12-16-2025/plans/plan-matrix-multiplication-kernels.md`

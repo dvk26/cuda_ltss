@@ -19,9 +19,13 @@ Does this phasing make sense? Should I adjust the order or granularity?
 ---
 
 Write your outline inside a file named  
-`structure_mixed_precision_and_checkpointing.md`  
+`structure-matrix-multiplication-kernels.md`  
 under:
 
 `documents/12-17-2025/plans/`
+
+Example filename:
+
+`documents/12-17-2025/plans/structure-matrix-multiplication-kernels.md`
 
 Get feedback on the structure before writing the detailed content.
