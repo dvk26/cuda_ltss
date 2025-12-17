@@ -1,6 +1,7 @@
 #include "gpu_autoencoder.hpp"
 #include <iostream>
 #include <cmath>
+#include <algorithm>
 #include <vector>
 #include <random>
 
@@ -26,7 +27,8 @@ __global__ void mse_loss_kernel(
     const float* __restrict__ target, // Ảnh gốc (Input)
     float* __restrict__ dY,           // Gradient đầu ra (để truyền ngược)
     float* __restrict__ loss_out,     // Biến tích lũy tổng Loss
-    int total_elements)
+    int total_elements,
+    float loss_scale)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -42,7 +44,7 @@ __global__ void mse_loss_kernel(
         
         // 1. Tính Gradient ngay tại chỗ: dL/dy = 2/N * (y - t)
         // Lưu vào dY để lát nữa Backward Pass dùng luôn, không cần tính lại trên CPU
-        dY[idx] = (2.0f * diff) / (float)total_elements;
+        dY[idx] = loss_scale * (2.0f * diff) / (float)total_elements;
         
         // 2. Tính bình phương lỗi cho Loss
         s_loss[tid] = diff * diff;
@@ -60,6 +62,32 @@ __global__ void mse_loss_kernel(
     // Thread đầu tiên của block cộng kết quả của block vào biến toàn cục
     if (tid == 0) {
         atomicAdd(loss_out, s_loss[0]);
+    }
+}
+
+__global__ void fp32_to_fp16_kernel(const float* __restrict__ x, __half* __restrict__ y, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    y[idx] = __float2half_rn(x[idx]);
+}
+
+__global__ void fp16_to_fp32_kernel(const __half* __restrict__ x, float* __restrict__ y, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    y[idx] = __half2float(x[idx]);
+}
+
+__global__ void check_nonfinite_kernel(const float* __restrict__ x, int total, int* __restrict__ found_inf_nan) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    if (!isfinite(x[idx])) {
+        *found_inf_nan = 1;
+    }
+}
+
+__global__ void clear_int_kernel(int* x) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *x = 0;
     }
 }
 
@@ -202,6 +230,119 @@ __global__ void conv2d_relu_forward_tiled_kernel(
 }
 
 // ----------------------------------------------------
+// 1c. Fused Conv2D + ReLU Forward (FP16 IO, FP32 accumulation)
+// X: FP16, W/B: FP32, Y: FP16
+// ----------------------------------------------------
+__global__ void conv2d_relu_forward_tiled_kernel_fp16io(
+    const __half* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    __half* __restrict__ y,
+    int N, int Cin, int H, int W, int Cout)
+{
+    __shared__ float s_x[SM_W][SM_W];
+    int tx = threadIdx.x; int ty = threadIdx.y;
+    int bx = blockIdx.x; int by = blockIdx.y;
+
+    int total_z = blockIdx.z;
+    int c_out = total_z % Cout;
+    int n     = total_z / Cout;
+
+    int h_out = by * TILE_W + ty;
+    int w_out = bx * TILE_W + tx;
+
+    float sum = 0.0f;
+    if (h_out < H && w_out < W) sum = b[c_out];
+
+    for (int c = 0; c < Cin; ++c) {
+        int h_base = by * TILE_W - HALO_R;
+        int w_base = bx * TILE_W - HALO_R;
+        int tid = ty * TILE_W + tx;
+        for (int i = tid; i < SM_W * SM_W; i += (TILE_W * TILE_W)) {
+            int r = i / SM_W; int c_sm = i % SM_W;
+            int h_in = h_base + r; int w_in = w_base + c_sm;
+            float val = 0.f;
+            if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                val = __half2float(x[((n * Cin + c) * H + h_in) * W + w_in]);
+            }
+            s_x[r][c_sm] = val;
+        }
+        __syncthreads();
+        if (h_out < H && w_out < W) {
+            for (int kh = 0; kh < K_SIZE; ++kh) {
+                for (int kw = 0; kw < K_SIZE; ++kw) {
+                    int w_idx = ((c_out * Cin + c) * K_SIZE + kh) * K_SIZE + kw;
+                    sum += s_x[ty + kh][tx + kw] * w[w_idx];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (h_out < H && w_out < W) {
+        float val = (sum > 0.f) ? sum : 0.f;
+        y[((n * Cout + c_out) * H + h_out) * W + w_out] = __float2half_rn(val);
+    }
+}
+
+// ----------------------------------------------------
+// 1d. Conv2D Forward (FP16 input, FP32 output)
+// Dùng cho layer cuối cùng để giữ output ở FP32 (loss/metrics ổn định).
+// ----------------------------------------------------
+__global__ void conv2d_forward_tiled_kernel_fp16in_fp32out(
+    const __half* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int Cin, int H, int W, int Cout)
+{
+    __shared__ float s_x[SM_W][SM_W];
+
+    int tx = threadIdx.x; int ty = threadIdx.y;
+    int bx = blockIdx.x; int by = blockIdx.y;
+
+    int total_z = blockIdx.z;
+    int c_out = total_z % Cout;
+    int n     = total_z / Cout;
+
+    int h_out = by * TILE_W + ty;
+    int w_out = bx * TILE_W + tx;
+
+    float sum = 0.0f;
+    if (h_out < H && w_out < W) sum = b[c_out];
+
+    for (int c = 0; c < Cin; ++c) {
+        int h_base = by * TILE_W - HALO_R;
+        int w_base = bx * TILE_W - HALO_R;
+        int tid = ty * TILE_W + tx;
+        for (int i = tid; i < SM_W * SM_W; i += (TILE_W * TILE_W)) {
+            int r = i / SM_W; int c_sm = i % SM_W;
+            int h_in = h_base + r; int w_in = w_base + c_sm;
+            float val = 0.f;
+            if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                val = __half2float(x[((n * Cin + c) * H + h_in) * W + w_in]);
+            }
+            s_x[r][c_sm] = val;
+        }
+        __syncthreads();
+
+        if (h_out < H && w_out < W) {
+            for (int kh = 0; kh < K_SIZE; ++kh) {
+                for (int kw = 0; kw < K_SIZE; ++kw) {
+                    int w_idx = ((c_out * Cin + c) * K_SIZE + kh) * K_SIZE + kw;
+                    sum += s_x[ty + kh][tx + kw] * w[w_idx];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (h_out < H && w_out < W) {
+        y[((n * Cout + c_out) * H + h_out) * W + w_out] = sum;
+    }
+}
+
+// ----------------------------------------------------
 // 2. Conv2D Backward DATA (Tính dX)
 // Tối ưu: Loại bỏ atomicAdd
 // Thay vì mỗi thread tính gradient output rồi cộng dồn vào input (Scatter - cần atomic)
@@ -317,6 +458,40 @@ __global__ void conv2d_backward_filter_kernel(
     }
 }
 
+__global__ void conv2d_backward_filter_kernel_fp16x(
+    const __half* __restrict__ x,
+    const float* __restrict__ dY,
+    float* __restrict__ gW,
+    float* __restrict__ gb,
+    int N, int Cin, int H, int W, int Cout)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * Cout * H * W;
+    if (idx >= total) return;
+
+    int w_out = idx % W; int tmp = idx / W;
+    int h_out = tmp % H; tmp /= H;
+    int c_out = tmp % Cout; int n = tmp / Cout;
+
+    float grad = dY[idx];
+    atomicAdd(&gb[c_out], grad);
+
+    for (int c = 0; c < Cin; ++c) {
+        for (int kh = 0; kh < 3; ++kh) {
+            for (int kw = 0; kw < 3; ++kw) {
+                int ih = h_out + kh - 1;
+                int iw = w_out + kw - 1;
+
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                    float val_x = __half2float(x[((n * Cin + c) * H + ih) * W + iw]);
+                    int w_idx = ((c_out * Cin + c) * 3 + kh) * 3 + kw;
+                    atomicAdd(&gW[w_idx], grad * val_x);
+                }
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------
 // Các Helper Kernel khác (Đơn giản, chưa dùng Shared Mem)
 // ----------------------------------------------------
@@ -326,6 +501,12 @@ __global__ void relu_backward_kernel(const float* __restrict__ y, const float* _
     if (idx >= total) return;
     // Đạo hàm ReLU: Nếu y > 0 thì dX = dY, ngược lại dX = 0
     dX[idx] = (y[idx] > 0.f) ? dY[idx] : 0.f;
+}
+
+__global__ void relu_backward_kernel_fp16y(const __half* __restrict__ y, const float* __restrict__ dY, float* __restrict__ dX, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    dX[idx] = (__half2float(y[idx]) > 0.f) ? dY[idx] : 0.f;
 }
 
 __global__ void maxpool2x2_forward_kernel(const float* __restrict__ x, float* __restrict__ y, int* __restrict__ mask, int N, int C, int H, int W) {
@@ -351,6 +532,29 @@ __global__ void maxpool2x2_forward_kernel(const float* __restrict__ x, float* __
     mask[idx] = bestk; // Lưu vị trí max để dùng cho backward
 }
 
+__global__ void maxpool2x2_forward_kernel_fp16(const __half* __restrict__ x, __half* __restrict__ y, int* __restrict__ mask, int N, int C, int H, int W) {
+    int Hout = H / 2; int Wout = W / 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * Hout * Wout;
+    if (idx >= total) return;
+
+    int w_out = idx % Wout; int tmp = idx / Wout;
+    int h_out = tmp % Hout; tmp /= Hout;
+    int c = tmp % C; int n = tmp / C;
+    int h0 = h_out * 2; int w0 = w_out * 2;
+
+    float best = -1e30f; int bestk = 0;
+    for (int kh = 0; kh < 2; ++kh) {
+        for (int kw = 0; kw < 2; ++kw) {
+            int x_idx = ((n * C + c) * H + h0 + kh) * W + w0 + kw;
+            float v = __half2float(x[x_idx]);
+            if (v > best) { best = v; bestk = kh * 2 + kw; }
+        }
+    }
+    y[idx] = __float2half_rn(best);
+    mask[idx] = bestk;
+}
+
 __global__ void maxpool2x2_backward_kernel(const float* __restrict__ dY, const int* __restrict__ mask, float* __restrict__ dX, int N, int C, int H, int W) {
     // Logic: Trả gradient về đúng vị trí max (dựa vào mask), các vị trí khác gradient = 0
     int Hout = H / 2; int Wout = W / 2;
@@ -370,6 +574,18 @@ __global__ void maxpool2x2_backward_kernel(const float* __restrict__ dY, const i
 
 __global__ void upsample2x_forward_kernel(const float* __restrict__ x, float* __restrict__ y, int N, int C, int H, int W) {
     // Nearest Neighbor Upsampling: Copy 1 pixel input ra 4 pixel output
+    int Hout = H * 2; int Wout = W * 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * Hout * Wout;
+    if (idx >= total) return;
+    int w_out = idx % Wout; int tmp = idx / Wout;
+    int h_out = tmp % Hout; tmp /= Hout;
+    int c = tmp % C; int n = tmp / C;
+    int ih = h_out / 2; int iw = w_out / 2;
+    y[idx] = x[((n * C + c) * H + ih) * W + iw];
+}
+
+__global__ void upsample2x_forward_kernel_fp16(const __half* __restrict__ x, __half* __restrict__ y, int N, int C, int H, int W) {
     int Hout = H * 2; int Wout = W * 2;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = N * C * Hout * Wout;
@@ -427,10 +643,24 @@ void launch_conv2d_relu_tiled(const float* x, const float* w, const float* b, fl
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_conv2d_relu_tiled_fp16io(const __half* x, const float* w, const float* b, __half* y, int N, int Cin, int H, int W, int Cout) {
+    dim3 block(16, 16);
+    dim3 grid((W + 15)/16, (H + 15)/16, N * Cout);
+    conv2d_relu_forward_tiled_kernel_fp16io<<<grid, block>>>(x, w, b, y, N, Cin, H, W, Cout);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_conv2d_tiled(const float* x, const float* w, const float* b, float* y, int N, int Cin, int H, int W, int Cout) {
     dim3 block(16, 16);
     dim3 grid((W + 15)/16, (H + 15)/16, N * Cout);
     conv2d_forward_tiled_kernel<<<grid, block>>>(x, w, b, y, N, Cin, H, W, Cout);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_conv2d_tiled_fp16in_fp32out(const __half* x, const float* w, const float* b, float* y, int N, int Cin, int H, int W, int Cout) {
+    dim3 block(16, 16);
+    dim3 grid((W + 15)/16, (H + 15)/16, N * Cout);
+    conv2d_forward_tiled_kernel_fp16in_fp32out<<<grid, block>>>(x, w, b, y, N, Cin, H, W, Cout);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -449,11 +679,32 @@ void launch_conv2d_backward(const float* x, const float* w, const float* dY, flo
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_conv2d_backward_fp16x(const __half* x, const float* w, const float* dY, float* dX, float* gW, float* gb, int N, int Cin, int H, int W, int Cout) {
+    dim3 block(16, 16);
+    dim3 grid_data((W + 15)/16, (H + 15)/16, N * Cin);
+    conv2d_backward_data_tiled_kernel<<<grid_data, block>>>(w, dY, dX, N, Cin, H, W, Cout);
+    CUDA_CHECK(cudaGetLastError());
+
+    const int BS = 256;
+    dim3 block_filter(BS);
+    dim3 grid_filter((N * Cout * H * W + BS - 1) / BS);
+    conv2d_backward_filter_kernel_fp16x<<<grid_filter, block_filter>>>(x, dY, gW, gb, N, Cin, H, W, Cout);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // --- Class Methods ---
 
 GPUAutoencoder::GPUAutoencoder(int batch_size, int H, int W) : N_(batch_size), H_(H), W_(W) {
     H1_ = H_ / 2; W1_ = W_ / 2;
     H2_ = H1_ / 2; W2_ = W1_ / 2;
+    checkpoint_mode_ = CheckpointMode::stage_boundaries;
+    loss_scale_ = 128.0f;
+    loss_scale_min_ = 1.0f;
+    loss_scale_max_ = 65536.0f;
+    loss_scale_growth_factor_ = 2.0f;
+    loss_scale_backoff_factor_ = 0.5f;
+    loss_scale_growth_interval_steps_ = 2000;
+    loss_scale_good_steps_ = 0;
     alloc_all();
     init_weights_random();
 }
@@ -478,19 +729,23 @@ void GPUAutoencoder::alloc_all() {
     CUDA_CHECK(cudaMalloc(&d_w5_, sz_w5 * sizeof(float))); CUDA_CHECK(cudaMalloc(&d_b5_, 3 * sizeof(float)));   CUDA_CHECK(cudaMalloc(&d_gw5_, sz_w5 * sizeof(float))); CUDA_CHECK(cudaMalloc(&d_gb5_, 3 * sizeof(float)));
 
     CUDA_CHECK(cudaMalloc(&d_x_,  nchw_size(N_, 3,   H_,  W_)   * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_c1_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_r1_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_p1_, nchw_size(N_, 256, H1_, W1_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_c2_, nchw_size(N_, 128, H1_, W1_) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_r2_, nchw_size(N_, 128, H1_, W1_) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_p2_, nchw_size(N_, 128, H2_, W2_) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_c3_, nchw_size(N_, 128, H2_, W2_) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_r3_, nchw_size(N_, 128, H2_, W2_) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_u1_, nchw_size(N_, 128, H1_, W1_) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_c4_, nchw_size(N_, 256, H1_, W1_) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_r4_, nchw_size(N_, 256, H1_, W1_) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_u2_, nchw_size(N_, 256, H_,  W_)  * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_xh_, nchw_size(N_, 3,   H_,  W_)   * sizeof(__half)));
+
+    CUDA_CHECK(cudaMalloc(&d_p1_, nchw_size(N_, 256, H1_, W1_)  * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_p2_, nchw_size(N_, 128, H2_, W2_)  * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_c5_, nchw_size(N_, 3,   H_,  W_)   * sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&d_scratch256_hw_,   nchw_size(N_, 256, H_,  W_)  * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_scratch256_h1w1_, nchw_size(N_, 256, H1_, W1_) * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_scratch128_h1w1_, nchw_size(N_, 128, H1_, W1_) * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_scratch128_h2w2_, nchw_size(N_, 128, H2_, W2_) * sizeof(__half)));
+
+    d_c1_ = d_scratch256_hw_;
+    d_u2_ = d_scratch256_hw_;
+    d_c4_ = d_scratch256_h1w1_;
+    d_c2_ = d_scratch128_h1w1_;
+    d_u1_ = d_scratch128_h1w1_;
+    d_c3_ = d_scratch128_h2w2_;
 
     CUDA_CHECK(cudaMalloc(&d_mask1_, nchw_size(N_, 256, H1_, W1_) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_mask2_, nchw_size(N_, 128, H2_, W2_) * sizeof(int)));
@@ -513,6 +768,7 @@ void GPUAutoencoder::alloc_all() {
     // [V1.4] Alloc biến cho Full GPU Pipeline (tránh copy CPU)
     CUDA_CHECK(cudaMalloc(&d_dy_, nchw_size(N_, 3, H_, W_) * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_loss_accum_, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_found_inf_nan_, sizeof(int)));
 }
 
 void GPUAutoencoder::free_all() {
@@ -523,11 +779,17 @@ void GPUAutoencoder::free_all() {
     safe_free(d_w3_); safe_free(d_b3_); safe_free(d_gw3_); safe_free(d_gb3_);
     safe_free(d_w4_); safe_free(d_b4_); safe_free(d_gw4_); safe_free(d_gb4_);
     safe_free(d_w5_); safe_free(d_b5_); safe_free(d_gw5_); safe_free(d_gb5_);
-    safe_free(d_x_);  safe_free(d_c1_); safe_free(d_r1_); safe_free(d_p1_);
-    safe_free(d_c2_); safe_free(d_r2_); safe_free(d_p2_);
-    safe_free(d_c3_); safe_free(d_r3_); safe_free(d_u1_);
-    safe_free(d_c4_); safe_free(d_r4_); safe_free(d_u2_);
+    safe_free(d_x_);
+    safe_free(d_xh_);
+    safe_free(d_p1_);
+    safe_free(d_p2_);
     safe_free(d_c5_);
+    safe_free(d_scratch256_hw_);
+    safe_free(d_scratch256_h1w1_);
+    safe_free(d_scratch128_h1w1_);
+    safe_free(d_scratch128_h2w2_);
+    d_c1_ = nullptr; d_c2_ = nullptr; d_c3_ = nullptr; d_c4_ = nullptr;
+    d_u1_ = nullptr; d_u2_ = nullptr;
     safe_free(d_mask1_); safe_free(d_mask2_);
     safe_free(d_dc5_); safe_free(d_du2_); safe_free(d_dr4_); safe_free(d_dc4_);
     safe_free(d_du1_); safe_free(d_dr3_); safe_free(d_dc3_);
@@ -536,6 +798,7 @@ void GPUAutoencoder::free_all() {
     safe_free(d_dx_);
     safe_free(d_dy_);
     safe_free(d_loss_accum_);
+    safe_free(d_found_inf_nan_);
 }
 
 void GPUAutoencoder::init_weights_random() {
@@ -562,6 +825,9 @@ void GPUAutoencoder::init_weights_random() {
 void GPUAutoencoder::set_input(const Tensor& x_host) {
     size_t sz = nchw_size(N_, 3, H_, W_);
     CUDA_CHECK(cudaMemcpy(d_x_, x_host.raw().data(), sz * sizeof(float), cudaMemcpyHostToDevice));
+    const int BS = 256;
+    fp32_to_fp16_kernel<<<(sz + BS - 1) / BS, BS>>>(d_x_, d_xh_, (int)sz);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // ----------------------------------------------------
@@ -569,63 +835,47 @@ void GPUAutoencoder::set_input(const Tensor& x_host) {
 // Sử dụng các Kernel Fused và Tiled để chạy nhanh nhất
 // ----------------------------------------------------
 void GPUAutoencoder::forward_pass() {
-    // 1. Conv1 + ReLU (Fused)
-    launch_conv2d_relu_tiled(d_x_, d_w1_, d_b1_, d_c1_, N_, 3, H_, W_, 256);
-    
-    // Copy kết quả sang d_r1_ (do logic backward cũ cần biến này).
-    // Nếu backward được viết lại hoàn toàn thì có thể bỏ bước này.
-    CUDA_CHECK(cudaMemcpy(d_r1_, d_c1_, nchw_size(N_,256,H_,W_)*sizeof(float), cudaMemcpyDeviceToDevice));
-
-    // 2. Pool1
-    const int BS = 256; dim3 block(BS);
-    maxpool2x2_forward_kernel<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_r1_, d_p1_, d_mask1_, N_, 256, H_, W_);
-
-    // 3. Conv2 + ReLU (Fused)
-    launch_conv2d_relu_tiled(d_p1_, d_w2_, d_b2_, d_c2_, N_, 256, H1_, W1_, 128);
-    CUDA_CHECK(cudaMemcpy(d_r2_, d_c2_, nchw_size(N_,128,H1_,W1_)*sizeof(float), cudaMemcpyDeviceToDevice));
-
-    // 4. Pool2 (Ra Latent Vector)
-    maxpool2x2_forward_kernel<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_r2_, d_p2_, d_mask2_, N_, 128, H1_, W1_);
-
-    // 5. Decoder Conv3 + ReLU (Fused)
-    launch_conv2d_relu_tiled(d_p2_, d_w3_, d_b3_, d_c3_, N_, 128, H2_, W2_, 128);
-    CUDA_CHECK(cudaMemcpy(d_r3_, d_c3_, nchw_size(N_,128,H2_,W2_)*sizeof(float), cudaMemcpyDeviceToDevice));
-
-    // 6. Upsample1
-    upsample2x_forward_kernel<<<(nchw_size(N_,128,H1_,W1_)+BS-1)/BS, block>>>(d_r3_, d_u1_, N_, 128, H2_, W2_);
-
-    // 7. Conv4 + ReLU (Fused)
-    launch_conv2d_relu_tiled(d_u1_, d_w4_, d_b4_, d_c4_, N_, 128, H1_, W1_, 256);
-    CUDA_CHECK(cudaMemcpy(d_r4_, d_c4_, nchw_size(N_,256,H1_,W1_)*sizeof(float), cudaMemcpyDeviceToDevice));
-
-    // 8. Upsample2
-    upsample2x_forward_kernel<<<(nchw_size(N_,256,H_,W_)+BS-1)/BS, block>>>(d_r4_, d_u2_, N_, 256, H1_, W1_);
-
-    // 9. Conv5 (Output - Không ReLU - Dùng Kernel Tiled thường)
-    launch_conv2d_tiled(d_u2_, d_w5_, d_b5_, d_c5_, N_, 256, H_, W_, 3);
-    
+    forward_encoder_to_p1();
+    forward_encoder_p1_to_p2();
+    forward_decoder_from_p2();
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// ----------------------------------------------------
-// Backward Pass
-// Tính Gradient ngược từ layer cuối về đầu và Update trọng số
-// ----------------------------------------------------
-void GPUAutoencoder::backward_pass(const float* d_dy_host_ptr, float lr) {
+void GPUAutoencoder::forward_encoder_to_p1() {
+    const int BS = 256; dim3 block(BS);
+    launch_conv2d_relu_tiled_fp16io(d_xh_, d_w1_, d_b1_, d_c1_, N_, 3, H_, W_, 256);
+    maxpool2x2_forward_kernel_fp16<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_c1_, d_p1_, d_mask1_, N_, 256, H_, W_);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void GPUAutoencoder::forward_encoder_p1_to_p2() {
+    const int BS = 256; dim3 block(BS);
+    launch_conv2d_relu_tiled_fp16io(d_p1_, d_w2_, d_b2_, d_c2_, N_, 256, H1_, W1_, 128);
+    maxpool2x2_forward_kernel_fp16<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_c2_, d_p2_, d_mask2_, N_, 128, H1_, W1_);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void GPUAutoencoder::forward_decoder_from_p2() {
+    const int BS = 256; dim3 block(BS);
+    launch_conv2d_relu_tiled_fp16io(d_p2_, d_w3_, d_b3_, d_c3_, N_, 128, H2_, W2_, 128);
+    upsample2x_forward_kernel_fp16<<<(nchw_size(N_,128,H1_,W1_)+BS-1)/BS, block>>>(d_c3_, d_u1_, N_, 128, H2_, W2_);
+    launch_conv2d_relu_tiled_fp16io(d_u1_, d_w4_, d_b4_, d_c4_, N_, 128, H1_, W1_, 256);
+    upsample2x_forward_kernel_fp16<<<(nchw_size(N_,256,H_,W_)+BS-1)/BS, block>>>(d_c4_, d_u2_, N_, 256, H1_, W1_);
+    launch_conv2d_tiled_fp16in_fp32out(d_u2_, d_w5_, d_b5_, d_c5_, N_, 256, H_, W_, 3);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void GPUAutoencoder::backward_compute_gradients(const float* d_dy_host_ptr) {
     const int BS = 256; dim3 block(BS);
     int total = N_ * 3 * H_ * W_;
-    
-    // Nếu d_dy_host_ptr là nullptr (khi gọi train_step), ta lấy gradient từ d_dy_ (đã tính trên GPU).
-    // Ngược lại thì copy từ CPU xuống (chế độ cũ - chậm).
+
     if (d_dy_host_ptr != nullptr) {
         CUDA_CHECK(cudaMemcpy(d_dc5_, d_dy_host_ptr, total * sizeof(float), cudaMemcpyHostToDevice));
     } else {
         CUDA_CHECK(cudaMemcpy(d_dc5_, d_dy_, total * sizeof(float), cudaMemcpyDeviceToDevice));
     }
 
-    // Zero toàn bộ các buffer Gradient trước khi tính toán
-    auto zero_buf = [&](float* p, size_t n) { zero_kernel<<<(n + BS - 1)/BS, block>>>(p, n); };
-    // (Danh sách zero buffer dài dòng... giữ nguyên như cũ)
+    auto zero_buf = [&](float* p, size_t n) { zero_kernel<<<(n + BS - 1)/BS, block>>>(p, (int)n); };
     zero_buf(d_gw1_, 256*3*3*3); zero_buf(d_gb1_, 256);
     zero_buf(d_gw2_, 128*256*3*3); zero_buf(d_gb2_, 128);
     zero_buf(d_gw3_, 128*128*3*3); zero_buf(d_gb3_, 128);
@@ -637,34 +887,49 @@ void GPUAutoencoder::backward_pass(const float* d_dy_host_ptr, float lr) {
     zero_buf(d_dp1_, nchw_size(N_,256,H1_,W1_)); zero_buf(d_dr1_, nchw_size(N_,256,H_,W_)); zero_buf(d_dc1_, nchw_size(N_,256,H_,W_));
     zero_buf(d_dx_,  nchw_size(N_,3,H_,W_));
 
-    // Thực hiện lan truyền ngược từng layer
-    // Sử dụng launch_conv2d_backward (Tối ưu dX)
-    launch_conv2d_backward(d_u2_, d_w5_, d_dc5_, d_du2_, d_gw5_, d_gb5_, N_, 256, H_, W_, 3);
-    upsample2x_backward_kernel<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_du2_, d_dr4_, N_, 256, H1_, W1_);
-    relu_backward_kernel<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_r4_, d_dr4_, d_dc4_, nchw_size(N_,256,H1_,W1_));
-    
-    launch_conv2d_backward(d_u1_, d_w4_, d_dc4_, d_du1_, d_gw4_, d_gb4_, N_, 128, H1_, W1_, 256);
-    upsample2x_backward_kernel<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_du1_, d_dr3_, N_, 128, H2_, W2_);
-    relu_backward_kernel<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_r3_, d_dr3_, d_dc3_, nchw_size(N_,128,H2_,W2_));
-    
-    launch_conv2d_backward(d_p2_, d_w3_, d_dc3_, d_dp2_, d_gw3_, d_gb3_, N_, 128, H2_, W2_, 128);
-    maxpool2x2_backward_kernel<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_dp2_, d_mask2_, d_dr2_, N_, 128, H1_, W1_);
-    relu_backward_kernel<<<(nchw_size(N_,128,H1_,W1_)+BS-1)/BS, block>>>(d_r2_, d_dr2_, d_dc2_, nchw_size(N_,128,H1_,W1_));
-    
-    launch_conv2d_backward(d_p1_, d_w2_, d_dc2_, d_dp1_, d_gw2_, d_gb2_, N_, 256, H1_, W1_, 128);
-    maxpool2x2_backward_kernel<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_dp1_, d_mask1_, d_dr1_, N_, 256, H_, W_);
-    relu_backward_kernel<<<(nchw_size(N_,256,H_,W_)+BS-1)/BS, block>>>(d_r1_, d_dr1_, d_dc1_, nchw_size(N_,256,H_,W_));
-    
-    launch_conv2d_backward(d_x_, d_w1_, d_dc1_, d_dx_, d_gw1_, d_gb1_, N_, 3, H_, W_, 256);
+    if (checkpoint_mode_ == CheckpointMode::stage_boundaries) {
+        forward_decoder_from_p2();
+    }
 
-    // Cập nhật trọng số (SGD Update)
-    auto sgd = [&](float* w, float* gw, int n) { sgd_update_kernel<<<(n+BS-1)/BS, block>>>(w, gw, lr, n); };
+    launch_conv2d_backward_fp16x(d_u2_, d_w5_, d_dc5_, d_du2_, d_gw5_, d_gb5_, N_, 256, H_, W_, 3);
+    upsample2x_backward_kernel<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_du2_, d_dr4_, N_, 256, H1_, W1_);
+    relu_backward_kernel_fp16y<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_c4_, d_dr4_, d_dc4_, (int)nchw_size(N_,256,H1_,W1_));
+
+    launch_conv2d_backward_fp16x(d_u1_, d_w4_, d_dc4_, d_du1_, d_gw4_, d_gb4_, N_, 128, H1_, W1_, 256);
+    upsample2x_backward_kernel<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_du1_, d_dr3_, N_, 128, H2_, W2_);
+    relu_backward_kernel_fp16y<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_c3_, d_dr3_, d_dc3_, (int)nchw_size(N_,128,H2_,W2_));
+
+    launch_conv2d_backward_fp16x(d_p2_, d_w3_, d_dc3_, d_dp2_, d_gw3_, d_gb3_, N_, 128, H2_, W2_, 128);
+
+    if (checkpoint_mode_ == CheckpointMode::stage_boundaries) {
+        forward_encoder_p1_to_p2();
+    }
+
+    maxpool2x2_backward_kernel<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_dp2_, d_mask2_, d_dr2_, N_, 128, H1_, W1_);
+    relu_backward_kernel_fp16y<<<(nchw_size(N_,128,H1_,W1_)+BS-1)/BS, block>>>(d_c2_, d_dr2_, d_dc2_, (int)nchw_size(N_,128,H1_,W1_));
+
+    launch_conv2d_backward_fp16x(d_p1_, d_w2_, d_dc2_, d_dp1_, d_gw2_, d_gb2_, N_, 256, H1_, W1_, 128);
+
+    if (checkpoint_mode_ == CheckpointMode::stage_boundaries) {
+        forward_encoder_to_p1();
+    }
+
+    maxpool2x2_backward_kernel<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_dp1_, d_mask1_, d_dr1_, N_, 256, H_, W_);
+    relu_backward_kernel_fp16y<<<(nchw_size(N_,256,H_,W_)+BS-1)/BS, block>>>(d_c1_, d_dr1_, d_dc1_, (int)nchw_size(N_,256,H_,W_));
+
+    launch_conv2d_backward_fp16x(d_xh_, d_w1_, d_dc1_, d_dx_, d_gw1_, d_gb1_, N_, 3, H_, W_, 256);
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void GPUAutoencoder::apply_sgd_update(float effective_lr) {
+    const int BS = 256; dim3 block(BS);
+    auto sgd = [&](float* w, float* gw, int n) { sgd_update_kernel<<<(n+BS-1)/BS, block>>>(w, gw, effective_lr, n); };
     sgd(d_w1_, d_gw1_, 256*3*3*3); sgd(d_b1_, d_gb1_, 256);
     sgd(d_w2_, d_gw2_, 128*256*3*3); sgd(d_b2_, d_gb2_, 128);
     sgd(d_w3_, d_gw3_, 128*128*3*3); sgd(d_b3_, d_gb3_, 128);
     sgd(d_w4_, d_gw4_, 256*128*3*3); sgd(d_b4_, d_gb4_, 256);
     sgd(d_w5_, d_gw5_, 3*256*3*3);   sgd(d_b5_, d_gb5_, 3);
-    
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
@@ -684,10 +949,39 @@ float GPUAutoencoder::train_step(const Tensor& x_host, float lr) {
     const int BS = 256;
     
     // Gọi MSE Kernel để tính Loss và Gradient dY
-    mse_loss_kernel<<<(total + BS - 1)/BS, BS, BS*sizeof(float)>>>(d_c5_, d_x_, d_dy_, d_loss_accum_, total);
-    
-    // Gọi Backward với tham số nullptr (báo hiệu dY đã có sẵn trên GPU)
-    backward_pass(nullptr, lr);
+    mse_loss_kernel<<<(total + BS - 1)/BS, BS, BS*sizeof(float)>>>(d_c5_, d_x_, d_dy_, d_loss_accum_, total, loss_scale_);
+    CUDA_CHECK(cudaGetLastError());
+
+    backward_compute_gradients(nullptr);
+
+    clear_int_kernel<<<1, 1>>>(d_found_inf_nan_);
+    CUDA_CHECK(cudaGetLastError());
+
+    check_nonfinite_kernel<<<(256*3*3*3 + BS - 1)/BS, BS>>>(d_gw1_, 256*3*3*3, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(256 + BS - 1)/BS, BS>>>(d_gb1_, 256, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(128*256*3*3 + BS - 1)/BS, BS>>>(d_gw2_, 128*256*3*3, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(128 + BS - 1)/BS, BS>>>(d_gb2_, 128, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(128*128*3*3 + BS - 1)/BS, BS>>>(d_gw3_, 128*128*3*3, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(128 + BS - 1)/BS, BS>>>(d_gb3_, 128, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(256*128*3*3 + BS - 1)/BS, BS>>>(d_gw4_, 256*128*3*3, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(256 + BS - 1)/BS, BS>>>(d_gb4_, 256, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(3*256*3*3 + BS - 1)/BS, BS>>>(d_gw5_, 3*256*3*3, d_found_inf_nan_);
+    check_nonfinite_kernel<<<(3 + BS - 1)/BS, BS>>>(d_gb5_, 3, d_found_inf_nan_);
+    CUDA_CHECK(cudaGetLastError());
+
+    int found_inf_nan = 0;
+    CUDA_CHECK(cudaMemcpy(&found_inf_nan, d_found_inf_nan_, sizeof(int), cudaMemcpyDeviceToHost));
+
+    if (found_inf_nan) {
+        loss_scale_ = std::max(loss_scale_ * loss_scale_backoff_factor_, loss_scale_min_);
+        loss_scale_good_steps_ = 0;
+    } else {
+        apply_sgd_update(lr / loss_scale_);
+        loss_scale_good_steps_ += 1;
+        if ((loss_scale_good_steps_ % loss_scale_growth_interval_steps_) == 0) {
+            loss_scale_ = std::min(loss_scale_ * loss_scale_growth_factor_, loss_scale_max_);
+        }
+    }
     
     // Copy giá trị Loss về CPU để in log
     float total_loss = 0.0f;
@@ -703,7 +997,7 @@ float GPUAutoencoder::compute_loss(const Tensor& x_host) {
     CUDA_CHECK(cudaMemset(d_loss_accum_, 0, sizeof(float)));
     int total = N_ * 3 * H_ * W_;
     const int BS = 256;
-    mse_loss_kernel<<<(total + BS - 1)/BS, BS, BS*sizeof(float)>>>(d_c5_, d_x_, d_dy_, d_loss_accum_, total);
+    mse_loss_kernel<<<(total + BS - 1)/BS, BS, BS*sizeof(float)>>>(d_c5_, d_x_, d_dy_, d_loss_accum_, total, 1.0f);
     float total_loss;
     CUDA_CHECK(cudaMemcpy(&total_loss, d_loss_accum_, sizeof(float), cudaMemcpyDeviceToHost));
     return total_loss / (float)total;
@@ -719,7 +1013,8 @@ Tensor GPUAutoencoder::forward(const Tensor& x_host) {
 }
 
 void GPUAutoencoder::backward_and_update(const Tensor& dOut, float lr) {
-    backward_pass(dOut.raw().data(), lr);
+    backward_compute_gradients(dOut.raw().data());
+    apply_sgd_update(lr);
 }
 
 void GPUAutoencoder::save_weights(const std::string& path) const {
@@ -740,40 +1035,32 @@ void GPUAutoencoder::save_weights(const std::string& path) const {
 
 Tensor GPUAutoencoder::encode(const Tensor& x_host) {
     set_input(x_host);
-    const int BS = 256; dim3 block(BS);
-    // Encoder dùng Fused Kernel
-    launch_conv2d_relu_tiled(d_x_, d_w1_, d_b1_, d_c1_, N_, 3, H_, W_, 256);
-    CUDA_CHECK(cudaMemcpy(d_r1_, d_c1_, nchw_size(N_,256,H_,W_)*sizeof(float), cudaMemcpyDeviceToDevice));
-    
-    maxpool2x2_forward_kernel<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_r1_, d_p1_, d_mask1_, N_, 256, H_, W_);
-    
-    launch_conv2d_relu_tiled(d_p1_, d_w2_, d_b2_, d_c2_, N_, 256, H1_, W1_, 128);
-    CUDA_CHECK(cudaMemcpy(d_r2_, d_c2_, nchw_size(N_,128,H1_,W1_)*sizeof(float), cudaMemcpyDeviceToDevice));
-    
-    maxpool2x2_forward_kernel<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_r2_, d_p2_, d_mask2_, N_, 128, H1_, W1_);
+    forward_encoder_to_p1();
+    forward_encoder_p1_to_p2();
     CUDA_CHECK(cudaDeviceSynchronize());
-    
+
+    size_t sz = nchw_size(N_, 128, H2_, W2_);
+    std::vector<__half> h_latent_half(sz);
+    CUDA_CHECK(cudaMemcpy(h_latent_half.data(), d_p2_, sz * sizeof(__half), cudaMemcpyDeviceToHost));
+
     Tensor latent(N_, 128, H2_, W2_);
-    CUDA_CHECK(cudaMemcpy(latent.raw().data(), d_p2_, nchw_size(N_,128,H2_,W2_)*sizeof(float), cudaMemcpyDeviceToHost));
+    float* h_latent = latent.raw().data();
+    for (size_t i = 0; i < sz; ++i) {
+        h_latent[i] = __half2float(h_latent_half[i]);
+    }
     return latent;
 }
 
 Tensor GPUAutoencoder::decode(const Tensor& z_host) {
-    CUDA_CHECK(cudaMemcpy(d_p2_, z_host.raw().data(), nchw_size(N_,128,H2_,W2_)*sizeof(float), cudaMemcpyHostToDevice));
-    const int BS = 256; dim3 block(BS);
-    
-    // Decoder dùng Fused Kernel
-    launch_conv2d_relu_tiled(d_p2_, d_w3_, d_b3_, d_c3_, N_, 128, H2_, W2_, 128);
-    CUDA_CHECK(cudaMemcpy(d_r3_, d_c3_, nchw_size(N_,128,H2_,W2_)*sizeof(float), cudaMemcpyDeviceToDevice));
-    
-    upsample2x_forward_kernel<<<(nchw_size(N_,128,H1_,W1_)+BS-1)/BS, block>>>(d_r3_, d_u1_, N_, 128, H2_, W2_);
-    
-    launch_conv2d_relu_tiled(d_u1_, d_w4_, d_b4_, d_c4_, N_, 128, H1_, W1_, 256);
-    CUDA_CHECK(cudaMemcpy(d_r4_, d_c4_, nchw_size(N_,256,H1_,W1_)*sizeof(float), cudaMemcpyDeviceToDevice));
-    
-    upsample2x_forward_kernel<<<(nchw_size(N_,256,H_,W_)+BS-1)/BS, block>>>(d_r4_, d_u2_, N_, 256, H1_, W1_);
-    
-    launch_conv2d_tiled(d_u2_, d_w5_, d_b5_, d_c5_, N_, 256, H_, W_, 3);
+    size_t sz = nchw_size(N_, 128, H2_, W2_);
+    std::vector<__half> h_latent_half(sz);
+    const float* h_latent = z_host.raw().data();
+    for (size_t i = 0; i < sz; ++i) {
+        h_latent_half[i] = __float2half_rn(h_latent[i]);
+    }
+    CUDA_CHECK(cudaMemcpy(d_p2_, h_latent_half.data(), sz * sizeof(__half), cudaMemcpyHostToDevice));
+
+    forward_decoder_from_p2();
     CUDA_CHECK(cudaDeviceSynchronize());
     
     Tensor output(N_, 3, H_, W_);

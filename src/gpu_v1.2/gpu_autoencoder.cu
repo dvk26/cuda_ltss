@@ -151,7 +151,7 @@ __global__ void conv2d_backward_data_tiled_kernel(
     
     // [FIX] Map Z-axis = N * Cin (vì output là dX có Cin channels)
     int total_z = blockIdx.z;
-    int c_in = total_z % Cin; 
+    int c_in = total_z % Cin;
     int bz   = total_z / Cin; // batch index
 
     int h_in = by * TILE_W + ty;
