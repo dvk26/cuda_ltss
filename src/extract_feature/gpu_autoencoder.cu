@@ -3,7 +3,7 @@
 #include <cmath>
 #include <vector>
 #include <random>
-
+#include <fstream>
 // ====================================================
 // 1. ĐỊNH NGHĨA KERNEL (DEVICE CODE)
 // ====================================================
@@ -13,7 +13,7 @@
 // Kích thước Kernel tích chập: 3x3
 #define K_SIZE 3
 // Bán kính phần viền (Halo) cần load thêm: (3-1)/2 = 1
-#define HALO_R 1
+#define HALO_R 1 
 // Kích thước Tile đầu vào cần load vào Shared Memory: 16 + 2 = 18x18
 #define SM_W (TILE_W + 2 * HALO_R) 
 
@@ -687,7 +687,7 @@ float GPUAutoencoder::train_step(const Tensor& x_host, float lr) {
     mse_loss_kernel<<<(total + BS - 1)/BS, BS, BS*sizeof(float)>>>(d_c5_, d_x_, d_dy_, d_loss_accum_, total);
     
     // Gọi Backward với tham số nullptr (báo hiệu dY đã có sẵn trên GPU)
-    backward_pass(nullptr, lr);
+    backward_pass(nullptr, lr); 
     
     // Copy giá trị Loss về CPU để in log
     float total_loss = 0.0f;
@@ -779,4 +779,40 @@ Tensor GPUAutoencoder::decode(const Tensor& z_host) {
     Tensor output(N_, 3, H_, W_);
     CUDA_CHECK(cudaMemcpy(output.raw().data(), d_c5_, nchw_size(N_,3,H_,W_)*sizeof(float), cudaMemcpyDeviceToHost));
     return output;
+}
+
+// Thêm đoạn này vào gpu_autoencoder.cu
+
+void GPUAutoencoder::load_weights(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Failed to open weights file for loading: " + path);
+    }
+
+    // Helper: Đọc từ file vào vector CPU -> Copy xuống GPU
+    auto load_tensor = [&](float* d_ptr, size_t n) {
+        std::vector<float> h_buf(n);
+        in.read(reinterpret_cast<char*>(h_buf.data()), n * sizeof(float));
+        
+        if (!in) {
+            throw std::runtime_error("Error reading data from file (unexpected EOF?)");
+        }
+        
+        CUDA_CHECK(cudaMemcpy(d_ptr, h_buf.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    };
+
+    // Thứ tự phải khớp 100% với hàm save_weights
+    load_tensor(d_w1_, 256 * 3 * 3 * 3);
+    load_tensor(d_b1_, 256);
+    load_tensor(d_w2_, 128 * 256 * 3 * 3);
+    load_tensor(d_b2_, 128);
+    load_tensor(d_w3_, 128 * 128 * 3 * 3);
+    load_tensor(d_b3_, 128);
+    load_tensor(d_w4_, 256 * 128 * 3 * 3);
+    load_tensor(d_b4_, 256);
+    load_tensor(d_w5_, 3 * 256 * 3 * 3);
+    load_tensor(d_b5_, 3);
+
+    in.close();
+    std::cout << "Successfully loaded weights from " << path << "\n";
 }
