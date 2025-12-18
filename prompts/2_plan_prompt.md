@@ -1,5 +1,5 @@
-research and create a detailed implementation plan to implement  
-`documents/12-16-2025/researches/research-matrix-multiplication-kernels.md`  
+research and create a detailed implementation plan to implement
+`documents/MM-DD-YYYY/researches/research-<kebab-case-topic>.md`
 and report to me using this format in Markdown.
 
 ---
@@ -24,8 +24,8 @@ Which approach aligns best with your vision?
 
 Place your findings under:
 
-`documents/12-16-2025/plans/`
+`documents/MM-DD-YYYY/plans/`
 
 Example filename:
 
-`documents/12-16-2025/plans/plan-matrix-multiplication-kernels.md`
+`documents/MM-DD-YYYY/plans/plan-<kebab-case-topic>.md`

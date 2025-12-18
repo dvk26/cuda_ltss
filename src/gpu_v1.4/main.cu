@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
     // 3. Cấu hình Hyperparams
     // Với v1.4 (Fusion + Shared Mem), bộ nhớ được tiết kiệm nên có thể tăng batch_size
     // Tuy nhiên giữ 64 để so sánh tốc độ với bản cũ cho khách quan.
-    int batch_size = 64; 
+    int batch_size = 128;
     int epochs = 20;
     float lr = 1e-3f;
 
@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
     DataLoader train_loader(ds.train_images(), ds.train_labels(), batch_size, true);   // shuffle
     DataLoader test_loader(ds.test_images(), ds.test_labels(), batch_size, false);     // no shuffle
 
-    std::cout << "Starting training v1.4 (Full GPU Pipeline)...\n";
+    std::cout << "Starting training v1.4...\n";
 
     // =========================
     // Training Loop

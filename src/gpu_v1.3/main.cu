@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
     DataLoader train_loader(ds.train_images(), ds.train_labels(), batch_size, true);   // shuffle
     DataLoader test_loader(ds.test_images(), ds.test_labels(), batch_size, false);     // no shuffle
 
-    std::cout << "Starting training v1.4 (Full GPU Pipeline)...\n";
+    std::cout << "Starting training v1.3...\n";
 
     // =========================
     // Training Loop

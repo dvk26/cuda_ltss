@@ -16,7 +16,7 @@
 // Bán kính phần viền (Halo) cần load thêm: (3-1)/2 = 1
 #define HALO_R 1
 // Kích thước Tile đầu vào cần load vào Shared Memory: 16 + 2 = 18x18
-#define SM_W (TILE_W + 2 * HALO_R) 
+#define SM_W (TILE_W + 2 * HALO_R)
 
 // ----------------------------------------------------
 // Kernel tính MSE Loss (Mean Squared Error)
@@ -750,20 +750,36 @@ void GPUAutoencoder::alloc_all() {
     CUDA_CHECK(cudaMalloc(&d_mask1_, nchw_size(N_, 256, H1_, W1_) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_mask2_, nchw_size(N_, 128, H2_, W2_) * sizeof(int)));
 
-    CUDA_CHECK(cudaMalloc(&d_dc5_, nchw_size(N_, 3,   H_,  W_)   * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_du2_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dr4_, nchw_size(N_, 256, H1_, W1_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dc4_, nchw_size(N_, 256, H1_, W1_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_du1_, nchw_size(N_, 128, H1_, W1_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dr3_, nchw_size(N_, 128, H2_, W2_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dc3_, nchw_size(N_, 128, H2_, W2_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dp2_, nchw_size(N_, 128, H2_, W2_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dr2_, nchw_size(N_, 128, H1_, W1_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dc2_, nchw_size(N_, 128, H1_, W1_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dp1_, nchw_size(N_, 256, H1_, W1_)  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dr1_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dc1_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dx_,  nchw_size(N_, 3,   H_,  W_)   * sizeof(float)));
+    // [v1.4] Memory aliasing for intermediate feature-map gradients:
+    // We only ever need two live gradients at a time in `backward_compute_gradients()`,
+    // so we allocate two pools (A/B) and alias the named gradient pointers onto them.
+    grad_pool_elems_ = std::max({
+        nchw_size(N_, 256, H_,  W_),   // du2, dr1, dc1
+        nchw_size(N_, 256, H1_, W1_),  // dr4, dc4, dp1
+        nchw_size(N_, 128, H1_, W1_),  // du1, dc2, dr2
+        nchw_size(N_, 128, H2_, W2_),  // dr3, dc3, dp2
+        nchw_size(N_, 3,   H_,  W_)    // dc5, dx
+    });
+    CUDA_CHECK(cudaMalloc(&d_grad_pool_a_, grad_pool_elems_ * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_pool_b_, grad_pool_elems_ * sizeof(float)));
+
+    // Gradient flow contract (ping-pong):
+    // dc5(A) -> du2(B) -> dr4(A) -> dc4(B) -> du1(A) -> dr3(B) -> dc3(A)
+    //     -> dp2(B) -> dr2(A) -> dc2(B) -> dp1(A) -> dr1(B) -> dc1(A) -> dx(B)
+    d_dc5_ = d_grad_pool_a_;
+    d_du2_ = d_grad_pool_b_;
+    d_dr4_ = d_grad_pool_a_;
+    d_dc4_ = d_grad_pool_b_;
+    d_du1_ = d_grad_pool_a_;
+    d_dr3_ = d_grad_pool_b_;
+    d_dc3_ = d_grad_pool_a_;
+    d_dp2_ = d_grad_pool_b_;
+    d_dr2_ = d_grad_pool_a_;
+    d_dc2_ = d_grad_pool_b_;
+    d_dp1_ = d_grad_pool_a_;
+    d_dr1_ = d_grad_pool_b_;
+    d_dc1_ = d_grad_pool_a_;
+    d_dx_  = d_grad_pool_b_;
 
     // [V1.4] Alloc biến cho Full GPU Pipeline (tránh copy CPU)
     CUDA_CHECK(cudaMalloc(&d_dy_, nchw_size(N_, 3, H_, W_) * sizeof(float)));
@@ -791,11 +807,15 @@ void GPUAutoencoder::free_all() {
     d_c1_ = nullptr; d_c2_ = nullptr; d_c3_ = nullptr; d_c4_ = nullptr;
     d_u1_ = nullptr; d_u2_ = nullptr;
     safe_free(d_mask1_); safe_free(d_mask2_);
-    safe_free(d_dc5_); safe_free(d_du2_); safe_free(d_dr4_); safe_free(d_dc4_);
-    safe_free(d_du1_); safe_free(d_dr3_); safe_free(d_dc3_);
-    safe_free(d_dp2_); safe_free(d_dr2_); safe_free(d_dc2_);
-    safe_free(d_dp1_); safe_free(d_dr1_); safe_free(d_dc1_);
-    safe_free(d_dx_);
+    safe_free(d_grad_pool_a_);
+    safe_free(d_grad_pool_b_);
+    d_dc5_ = nullptr;
+    d_du2_ = nullptr; d_dr4_ = nullptr; d_dc4_ = nullptr;
+    d_du1_ = nullptr; d_dr3_ = nullptr; d_dc3_ = nullptr;
+    d_dp2_ = nullptr; d_dr2_ = nullptr; d_dc2_ = nullptr;
+    d_dp1_ = nullptr; d_dr1_ = nullptr; d_dc1_ = nullptr;
+    d_dx_  = nullptr;
+    grad_pool_elems_ = 0;
     safe_free(d_dy_);
     safe_free(d_loss_accum_);
     safe_free(d_found_inf_nan_);
@@ -881,11 +901,6 @@ void GPUAutoencoder::backward_compute_gradients(const float* d_dy_host_ptr) {
     zero_buf(d_gw3_, 128*128*3*3); zero_buf(d_gb3_, 128);
     zero_buf(d_gw4_, 256*128*3*3); zero_buf(d_gb4_, 256);
     zero_buf(d_gw5_, 3*256*3*3);   zero_buf(d_gb5_, 3);
-    zero_buf(d_du2_, nchw_size(N_,256,H_,W_)); zero_buf(d_dr4_, nchw_size(N_,256,H1_,W1_)); zero_buf(d_dc4_, nchw_size(N_,256,H1_,W1_));
-    zero_buf(d_du1_, nchw_size(N_,128,H1_,W1_)); zero_buf(d_dr3_, nchw_size(N_,128,H2_,W2_)); zero_buf(d_dc3_, nchw_size(N_,128,H2_,W2_));
-    zero_buf(d_dp2_, nchw_size(N_,128,H2_,W2_)); zero_buf(d_dr2_, nchw_size(N_,128,H1_,W1_)); zero_buf(d_dc2_, nchw_size(N_,128,H1_,W1_));
-    zero_buf(d_dp1_, nchw_size(N_,256,H1_,W1_)); zero_buf(d_dr1_, nchw_size(N_,256,H_,W_)); zero_buf(d_dc1_, nchw_size(N_,256,H_,W_));
-    zero_buf(d_dx_,  nchw_size(N_,3,H_,W_));
 
     if (checkpoint_mode_ == CheckpointMode::stage_boundaries) {
         forward_decoder_from_p2();
@@ -905,6 +920,8 @@ void GPUAutoencoder::backward_compute_gradients(const float* d_dy_host_ptr) {
         forward_encoder_p1_to_p2();
     }
 
+    // maxpool backward accumulates with atomicAdd into dX, so dX must be zeroed right before.
+    zero_buf(d_dr2_, nchw_size(N_, 128, H1_, W1_));
     maxpool2x2_backward_kernel<<<(nchw_size(N_,128,H2_,W2_)+BS-1)/BS, block>>>(d_dp2_, d_mask2_, d_dr2_, N_, 128, H1_, W1_);
     relu_backward_kernel_fp16y<<<(nchw_size(N_,128,H1_,W1_)+BS-1)/BS, block>>>(d_c2_, d_dr2_, d_dc2_, (int)nchw_size(N_,128,H1_,W1_));
 
@@ -914,6 +931,8 @@ void GPUAutoencoder::backward_compute_gradients(const float* d_dy_host_ptr) {
         forward_encoder_to_p1();
     }
 
+    // maxpool backward accumulates with atomicAdd into dX, so dX must be zeroed right before.
+    zero_buf(d_dr1_, nchw_size(N_, 256, H_, W_));
     maxpool2x2_backward_kernel<<<(nchw_size(N_,256,H1_,W1_)+BS-1)/BS, block>>>(d_dp1_, d_mask1_, d_dr1_, N_, 256, H_, W_);
     relu_backward_kernel_fp16y<<<(nchw_size(N_,256,H_,W_)+BS-1)/BS, block>>>(d_c1_, d_dr1_, d_dc1_, (int)nchw_size(N_,256,H_,W_));
 

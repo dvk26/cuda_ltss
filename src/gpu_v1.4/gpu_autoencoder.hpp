@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <random>
 #include <fstream>
+#include <cstddef>
 #include "../include/tensor.hpp"
 
 // =====================
@@ -95,6 +96,13 @@ private:
     int* d_mask2_;
 
     // ---------- Gradients ----------
+    // [v1.4] Ping-pong gradient pools:
+    // - d_grad_pool_a_/b_ are the owners (the only pointers that are cudaFree'd).
+    // - The named gradients (d_dc5_, d_du2_, ...) are aliases into one of the pools.
+    float* d_grad_pool_a_ = nullptr;
+    float* d_grad_pool_b_ = nullptr;
+    size_t grad_pool_elems_ = 0;
+
     float* d_dc5_;    // dL/dc5 (Gradient tại output layer)
     float* d_du2_; float* d_dr4_; float* d_dc4_;
     float* d_du1_; float* d_dr3_; float* d_dc3_;
