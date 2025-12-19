@@ -465,31 +465,39 @@ __global__ void conv2d_backward_filter_kernel_fp16x(
     float* __restrict__ gb,
     int N, int Cin, int H, int W, int Cout)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * Cout * H * W;
-    if (idx >= total) return;
+    // Thread mapping: Each thread is responsible for ONE weight
+    // total_weights = Cout * Cin * 3 * 3
+    int w_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w_idx >= Cout * Cin * 9) return;
 
-    int w_out = idx % W; int tmp = idx / W;
-    int h_out = tmp % H; tmp /= H;
-    int c_out = tmp % Cout; int n = tmp / Cout;
+    // Decode weight coordinates
+    int kw = w_idx % 3;
+    int kh = (w_idx / 3) % 3;
+    int c_in = (w_idx / 9) % Cin;
+    int c_out = (w_idx / 9) / Cin;
 
-    float grad = dY[idx];
-    atomicAdd(&gb[c_out], grad);
+    float partial_sum = 0.0f; // <--- THE REGISTER
 
-    for (int c = 0; c < Cin; ++c) {
-        for (int kh = 0; kh < 3; ++kh) {
-            for (int kw = 0; kw < 3; ++kw) {
-                int ih = h_out + kh - 1;
-                int iw = w_out + kw - 1;
+    // Loop over the Batch and Spatial dimensions
+    for (int n = 0; n < N; ++n) {
+        for (int h = 0; h < H; ++h) {
+            for (int w = 0; w < W; ++w) {
+                int ih = h + kh - 1; // Input height with padding
+                int iw = w + kw - 1;
 
                 if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                    float val_x = __half2float(x[((n * Cin + c) * H + ih) * W + iw]);
-                    int w_idx = ((c_out * Cin + c) * 3 + kh) * 3 + kw;
-                    atomicAdd(&gW[w_idx], grad * val_x);
+                    float grad = dY[((n * Cout + c_out) * H + h) * W + w];
+                    float val_x = __half2float(x[((n * Cin + c_in) * H + ih) * W + iw]);
+                    
+                    // Accumulate in the register (NO ATOMIC HERE)
+                    partial_sum += grad * val_x;
                 }
             }
         }
     }
+
+    // FINAL STEP: After all loops, call atomicAdd exactly ONCE
+    atomicAdd(&gW[w_idx], partial_sum);
 }
 
 // ----------------------------------------------------
