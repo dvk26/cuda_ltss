@@ -13,13 +13,13 @@ int main(int argc, char** argv) {
     }
 
     std::string cifar_dir = argv[1];
-    bool keep_10_percent = false;
+    bool keep_four_percent = false;
 
     int i = 2;
     while (i < argc) {
         std::string arg = argv[i];
         if (arg == "--keep-partial") {
-            keep_10_percent = true;
+            keep_four_percent = true;
             i += 1;
         } else {
             std::cerr << "Error: Unknown argument '" << arg << "'\n";
@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Loading CIFAR-10...\n";
     CIFAR10 ds;
-    ds.load(cifar_dir, keep_10_percent);
+    ds.load(cifar_dir, keep_four_percent);
 
     int Ntrain = ds.train_size();
     int Ntest  = ds.test_size();
@@ -46,7 +46,6 @@ int main(int argc, char** argv) {
     fs::create_directories(out_dir);
 
     GPUAutoencoder gpu_ae(batch_size, 32, 32);
-    MSELoss criterion;
 
     // Create data loaders
     DataLoader train_loader(ds.train_images(), ds.train_labels(), batch_size, true);   // shuffle
@@ -61,6 +60,7 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::high_resolution_clock::now();
         double epoch_loss = 0.0;
         int train_nb = 0;
+        int num_batches = train_loader.num_batches();
 
         while (train_loader.has_next()) {
             auto batch_data = train_loader.next();
@@ -71,29 +71,31 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // Print progress
-            if (train_nb > 0 && train_nb % 16 == 0) {
-                std::cout << "[Epoch " << ep
-                          << "] batch " << train_nb << "/" << train_loader.num_batches() << "\n";
-            }
-
             // ----- FORWARD -----
             Tensor y = gpu_ae.forward(x);
 
-            // ----- COMPUTE LOSS & GRADIENT -----
-            auto [loss, dY] = criterion.forward_backward(y, x);
+            // ----- COMPUTE LOSS & GRADIENT (gradient is saved inside Autoencoder class) -----
+            float loss = gpu_ae.compute_loss();
             epoch_loss += loss;
             ++train_nb;
             // ----- BACKWARD + UPDATE -----
-            gpu_ae.backward_and_update(dY, lr);
+            gpu_ae.backward_and_update(lr);
+
+            // Print progress (cập nhật trên cùng 1 dòng cho gọn)
+            if (train_nb % 10 == 0 || train_nb == num_batches) {
+                std::cout << "\r[Epoch " << ep << "/" << epochs << "] "
+                          << "Batch " << train_nb << "/" << num_batches 
+                          << " | Loss: " << std::fixed << std::setprecision(4) << (epoch_loss / train_nb) 
+                          << std::flush;
+            }
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
         double sec = std::chrono::duration<double>(t1 - t0).count();
 
-        std::cout << "Epoch " << ep
+        std::cout << "\n=== Epoch " << ep
                   << " | train_loss=" << (epoch_loss / train_nb)
-                  << " | time=" << sec << "s\n";
+                  << " | time=" << sec << "s ===\n";
 
         // Save weights directly from GPU
         gpu_ae.save_weights(out_dir + "/weights_epoch_" + std::to_string(ep) + ".bin");
@@ -117,13 +119,13 @@ int main(int argc, char** argv) {
         }
 
         Tensor y_test = gpu_ae.forward(x_test);
-        auto [loss, dY] = criterion.forward_backward(y_test, x_test);
+        float loss = gpu_ae.compute_loss();
         test_loss += loss;
         ++test_nb;
     }
 
     std::cout << "Final test_loss=" << (test_loss / test_nb) << "\n";
-    std::cout << "Done.\nCheck ./" << out_dir << "/*.bin for weights.\n";
+    std::cout << "Done. Check ./" << out_dir << "/*.bin for weights.\n";
 
     cudaDeviceReset();
     return 0;

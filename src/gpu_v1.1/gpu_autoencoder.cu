@@ -5,7 +5,34 @@
 // ====================================================
 // KERNELS
 // ====================================================
+// ----------------------------------------------------
+// Kernel tính MSE Loss (Mean Squared Error)
+// Tối ưu: Tính luôn Gradient dY và Loss tổng cùng lúc
+// ----------------------------------------------------
+__global__ void mse_loss_kernel(
+    const float* __restrict__ pred,   // Ảnh tái tạo (Output của mạng)
+    const float* __restrict__ target, // Ảnh gốc (Input)
+    float* __restrict__ dY,           // Gradient đầu ra (để truyền ngược)
+    float* __restrict__ loss_out,     // Biến tích lũy tổng Loss
+    int total_elements)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_elements) {
+        float p = pred[idx];
+        float t = target[idx];
+        float diff = p - t;
 
+        // 1. Tính Gradient (Vẫn giữ nguyên vì đây là tính toán độc lập)
+        dY[idx] = (2.0f * diff) / (float)total_elements;
+
+        // 2. Tính Loss và cộng trực tiếp vào biến Global
+        float local_loss = (diff * diff) / (float)total_elements; 
+        
+        // Đây có thể là bottleneck hiệu năng
+        atomicAdd(loss_out, local_loss);
+    }
+}
 // ---- 1. Conv2D forward: 3x3, pad=1, stride=1, NCHW ----
 __global__ void conv2d_forward_kernel(
     const float* __restrict__ x,
@@ -339,6 +366,9 @@ void GPUAutoencoder::alloc_all()
     CUDA_CHECK(cudaMalloc(&d_dr1_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dc1_, nchw_size(N_, 256, H_,  W_)   * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dx_,  nchw_size(N_, 3,   H_,  W_)   * sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&d_dy_, nchw_size(N_, 3, H_, W_) * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_loss_accum_, sizeof(float)));
 }
 
 void GPUAutoencoder::free_all()
@@ -364,6 +394,9 @@ void GPUAutoencoder::free_all()
     safe_free(d_dp2_); safe_free(d_dr2_); safe_free(d_dc2_);
     safe_free(d_dp1_); safe_free(d_dr1_); safe_free(d_dc1_);
     safe_free(d_dx_);
+
+    safe_free(d_dy_);
+    safe_free(d_loss_accum_);
 }
 
 void GPUAutoencoder::init_weights_random()
@@ -390,142 +423,7 @@ void GPUAutoencoder::init_weights_random()
     init_kaiming(d_w5_, 3, 256, 3);   init_zero(d_b5_, 3);
 }
 
-void GPUAutoencoder::set_input(const Tensor& x_host)
-{
-    size_t sz = nchw_size(N_, 3, H_, W_);
-    CUDA_CHECK(cudaMemcpy(d_x_, x_host.raw().data(), sz * sizeof(float), cudaMemcpyHostToDevice));
-}
-
-void GPUAutoencoder::forward_pass()
-{
-    const int BS = 256;
-    dim3 block(BS);
-
-    // Conv1
-    {
-        dim3 grid((N_ * 256 * H_ * W_ + BS - 1) / BS);
-        conv2d_forward_kernel<<<grid, block>>>(
-            d_x_, d_w1_, d_b1_, d_c1_, N_, 3, H_, W_, 256);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // ReLU1: c1 -> r1
-    {
-        int total = N_ * 256 * H_ * W_;
-        dim3 grid((total + BS - 1) / BS);
-        relu_forward_kernel<<<grid, block>>>(d_c1_, total);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpy(d_r1_, d_c1_, total * sizeof(float), cudaMemcpyDeviceToDevice));
-    }
-
-    // Pool1: r1 -> p1
-    {
-        int total = N_ * 256 * H1_ * W1_;
-        dim3 grid((total + BS - 1) / BS);
-        maxpool2x2_forward_kernel<<<grid, block>>>(
-            d_r1_, d_p1_, d_mask1_, N_, 256, H_, W_);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // Conv2: 256->128
-    {
-        dim3 grid((N_ * 128 * H1_ * W1_ + BS - 1) / BS);
-        conv2d_forward_kernel<<<grid, block>>>(
-            d_p1_, d_w2_, d_b2_, d_c2_, N_, 256, H1_, W1_, 128);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // ReLU2
-    {
-        int total = N_ * 128 * H1_ * W1_;
-        dim3 grid((total + BS - 1) / BS);
-        relu_forward_kernel<<<grid, block>>>(d_c2_, total);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpy(d_r2_, d_c2_, total * sizeof(float), cudaMemcpyDeviceToDevice));
-    }
-
-    // Pool2: r2 -> p2 (latent)
-    {
-        int total = N_ * 128 * H2_ * W2_;
-        dim3 grid((total + BS - 1) / BS);
-        maxpool2x2_forward_kernel<<<grid, block>>>(
-            d_r2_, d_p2_, d_mask2_, N_, 128, H1_, W1_);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // ---- Decoder ----
-
-    // Conv3: 128->128
-    {
-        dim3 grid((N_ * 128 * H2_ * W2_ + BS - 1) / BS);
-        conv2d_forward_kernel<<<grid, block>>>(
-            d_p2_, d_w3_, d_b3_, d_c3_, N_, 128, H2_, W2_, 128);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // ReLU3
-    {
-        int total = N_ * 128 * H2_ * W2_;
-        dim3 grid((total + BS - 1) / BS);
-        relu_forward_kernel<<<grid, block>>>(d_c3_, total);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpy(d_r3_, d_c3_, total * sizeof(float), cudaMemcpyDeviceToDevice));
-    }
-
-    // Upsample1: [N,128,H2,W2] -> [N,128,H1,W1]
-    {
-        int total = N_ * 128 * H1_ * W1_;
-        dim3 grid((total + BS - 1) / BS);
-        upsample2x_forward_kernel<<<grid, block>>>(
-            d_r3_, d_u1_, N_, 128, H2_, W2_);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // Conv4: 128->256
-    {
-        dim3 grid((N_ * 256 * H1_ * W1_ + BS - 1) / BS);
-        conv2d_forward_kernel<<<grid, block>>>(
-            d_u1_, d_w4_, d_b4_, d_c4_, N_, 128, H1_, W1_, 256);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // ReLU4
-    {
-        int total = N_ * 256 * H1_ * W1_;
-        dim3 grid((total + BS - 1) / BS);
-        relu_forward_kernel<<<grid, block>>>(d_c4_, total);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpy(d_r4_, d_c4_, total * sizeof(float), cudaMemcpyDeviceToDevice));
-    }
-
-    // Upsample2: [N,256,H1,W1] -> [N,256,H,W]
-    {
-        int total = N_ * 256 * H_ * W_;
-        dim3 grid((total + BS - 1) / BS);
-        upsample2x_forward_kernel<<<grid, block>>>(
-            d_r4_, d_u2_, N_, 256, H1_, W1_);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // Conv5: 256->3 (output)
-    {
-        dim3 grid((N_ * 3 * H_ * W_ + BS - 1) / BS);
-        conv2d_forward_kernel<<<grid, block>>>(
-            d_u2_, d_w5_, d_b5_, d_c5_, N_, 256, H_, W_, 3);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-Tensor GPUAutoencoder::encode(const Tensor& x_host)
-{
-    if (x_host.N() != N_ || x_host.C() != 3 || x_host.H() != H_ || x_host.W() != W_) {
-        throw std::runtime_error("Input shape mismatch in encode");
-    }
-
-    set_input(x_host);
-
+void GPUAutoencoder::encode_no_copy() {
     // Forward encoder only: x -> c1 -> r1 -> p1 -> c2 -> r2 -> p2 (latent)
     const int BS = 256;
     dim3 block(BS);
@@ -583,25 +481,32 @@ Tensor GPUAutoencoder::encode(const Tensor& x_host)
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
+}
 
-    // Copy latent to host
+Tensor GPUAutoencoder::encode(const Tensor& x_host)
+{   
+    // Check shape mismatch
+    if (x_host.N() != N_ || x_host.C() != 3 || x_host.H() != H_ || x_host.W() != W_) {
+        throw std::runtime_error("Input shape mismatch in encode");
+    }
+
+    // Copy original image from host to device
+    size_t sz = nchw_size(N_, 3, H_, W_);
+    CUDA_CHECK(cudaMemcpy(d_x_, x_host.raw().data(), sz * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // Call encode function. Latent (d_p2_) is on GPU
+    encode_no_copy();
+
+    // Copy latent from device to host
     Tensor latent(N_, 128, H2_, W2_);
-    size_t sz = nchw_size(N_, 128, H2_, W2_) * sizeof(float);
+    sz = nchw_size(N_, 128, H2_, W2_) * sizeof(float);
     CUDA_CHECK(cudaMemcpy(latent.raw().data(), d_p2_, sz, cudaMemcpyDeviceToHost));
 
     return latent;
 }
 
-Tensor GPUAutoencoder::decode(const Tensor& z_host)
+void GPUAutoencoder::decode_no_copy()
 {
-    if (z_host.N() != N_ || z_host.C() != 128 || z_host.H() != H2_ || z_host.W() != W2_) {
-        throw std::runtime_error("Latent shape mismatch in decode");
-    }
-
-    // Copy latent to GPU
-    size_t sz = nchw_size(N_, 128, H2_, W2_) * sizeof(float);
-    CUDA_CHECK(cudaMemcpy(d_p2_, z_host.raw().data(), sz, cudaMemcpyHostToDevice));
-
     // Forward decoder only: z -> c3 -> r3 -> u1 -> c4 -> r4 -> u2 -> c5
     const int BS = 256;
     dim3 block(BS);
@@ -667,8 +572,23 @@ Tensor GPUAutoencoder::decode(const Tensor& z_host)
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
+}
 
-    // Copy output to host
+Tensor GPUAutoencoder::decode(const Tensor& z_host)
+{
+    // Check shape mismatch
+    if (z_host.N() != N_ || z_host.C() != 128 || z_host.H() != H2_ || z_host.W() != W2_) {
+        throw std::runtime_error("Latent shape mismatch in decode");
+    }
+
+    // Copy latent from host to device
+    size_t sz = nchw_size(N_, 128, H2_, W2_) * sizeof(float);
+    CUDA_CHECK(cudaMemcpy(d_p2_, z_host.raw().data(), sz, cudaMemcpyHostToDevice));
+
+    // Call decode function. Reconstructed image (d_c5_) is on GPU
+    decode_no_copy();
+
+    // Copy reconstructed image from device to host
     Tensor output(N_, 3, H_, W_);
     sz = nchw_size(N_, 3, H_, W_) * sizeof(float);
     CUDA_CHECK(cudaMemcpy(output.raw().data(), d_c5_, sz, cudaMemcpyDeviceToHost));
@@ -678,31 +598,36 @@ Tensor GPUAutoencoder::decode(const Tensor& z_host)
 
 Tensor GPUAutoencoder::forward(const Tensor& x_host)
 {
+    // Check shape mismatch
     if (x_host.N() != N_ || x_host.C() != 3 || x_host.H() != H_ || x_host.W() != W_) {
         throw std::runtime_error("Input shape mismatch");
     }
+    
+   // Copy original image from host to device
+    size_t sz = nchw_size(N_, 3, H_, W_);
+    CUDA_CHECK(cudaMemcpy(d_x_, x_host.raw().data(), sz * sizeof(float), cudaMemcpyHostToDevice));
 
-    set_input(x_host);
-    forward_pass();
+    // Encode, then decode
+    encode_no_copy();
+    decode_no_copy();
 
+    // Copy reconstructed image from device to host
     Tensor output(N_, 3, H_, W_);
-    size_t sz = nchw_size(N_, 3, H_, W_) * sizeof(float);
+    sz = nchw_size(N_, 3, H_, W_) * sizeof(float);
     CUDA_CHECK(cudaMemcpy(output.raw().data(), d_c5_, sz, cudaMemcpyDeviceToHost));
 
     return output;
 }
 
-void GPUAutoencoder::backward_pass(const float* d_dy_, float lr)
+void GPUAutoencoder::backward_and_update(float lr)
 {
     const int BS = 256;
     dim3 block(BS);
 
     // dC5 = dY
-    {
-        int total = N_ * 3 * H_ * W_;
-        dim3 grid((total + BS - 1) / BS);
-        CUDA_CHECK(cudaMemcpy(d_dc5_, d_dy_, total * sizeof(float), cudaMemcpyHostToDevice));
-    }
+    int total = N_ * 3 * H_ * W_;
+    dim3 grid((total + BS - 1) / BS);
+    CUDA_CHECK(cudaMemcpy(d_dc5_, d_dy_, total * sizeof(float), cudaMemcpyDeviceToDevice));
 
     // Zero gradient buffers
     auto zero_buf = [&](float* p, size_t n) {
@@ -735,6 +660,7 @@ void GPUAutoencoder::backward_pass(const float* d_dy_, float lr)
     zero_buf(d_dr1_, nchw_size(N_,256,H_,W_));
     zero_buf(d_dc1_, nchw_size(N_,256,H_,W_));
     zero_buf(d_dx_,  nchw_size(N_,3,H_,W_));
+    zero_buf(d_dy_, nchw_size(N_, 3, H_, W_));
 
     // Backward qua Conv5
     {
@@ -874,13 +800,16 @@ void GPUAutoencoder::backward_pass(const float* d_dy_, float lr)
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-void GPUAutoencoder::backward_and_update(const Tensor& dOut, float lr)
-{
-    if (dOut.N() != N_ || dOut.C() != 3 || dOut.H() != H_ || dOut.W() != W_) {
-        throw std::runtime_error("Gradient shape mismatch");
-    }
+float GPUAutoencoder::compute_loss() {
+    int total = N_ * 3 * H_ * W_;
+    const int BS = 256;
+    cudaMemset(d_loss_accum_, 0, sizeof(float)); // Reset biến về 0
+    mse_loss_kernel<<<(total + BS - 1) / BS, BS>>>(d_c5_, d_x_, d_dy_, d_loss_accum_, total);
+    
+    float loss = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&loss, d_loss_accum_, sizeof(float), cudaMemcpyDeviceToHost));
 
-    backward_pass(dOut.raw().data(), lr);
+    return loss;
 }
 
 void GPUAutoencoder::save_weights(const std::string& path) const

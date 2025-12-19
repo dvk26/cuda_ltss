@@ -44,8 +44,11 @@ public:
     // Forward: x -> encode -> decode -> y (inference only, no backprop)
     Tensor forward(const Tensor& x_host);
 
-    // Backward + SGD update: backprop from dOut and update weights
-    void backward_and_update(const Tensor& dOut, float lr);
+    // Backward + SGD update: backprop from d_dy_ and update weights
+    void backward_and_update(float lr);
+
+    // Compute MSE Loss and its gradient
+    float compute_loss();
 
     // Save weights directly from GPU to file
     void save_weights(const std::string& path) const;
@@ -108,19 +111,16 @@ private:
     float* d_dc1_;
     float* d_dx_;     // dL/dx
 
+    float* d_dy_;         // Chứa gradient (Pred - Target) tính ngay trên GPU
+    float* d_loss_accum_; // Buffer 1 float để tích lũy Loss
+
     // ---------- Helpers ----------
     void alloc_all();
     void free_all();
     void init_weights_random();
 
-    // Forward pass: compute c1->r1->p1->...->c5
-    void forward_pass();
-    
-    // Backward pass: compute gradients from d_dy_
-    void backward_pass(const float* d_dy_, float lr);
-
-    // Set input tensor
-    void set_input(const Tensor& x_host);
+    void encode_no_copy();
+    void decode_no_copy();
 
     // Không cho copy
     GPUAutoencoder(const GPUAutoencoder&) = delete;
