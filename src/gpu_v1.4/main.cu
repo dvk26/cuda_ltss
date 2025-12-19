@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <iomanip> // Để format in số cho đẹp
 #include <algorithm>
+#include <cstring>
 #include <cuda_runtime.h>
 
 namespace fs = std::filesystem;
@@ -62,6 +63,22 @@ int main(int argc, char** argv) {
 
     std::cout << "Starting training v1.4...\n";
 
+    cudaStream_t stream_h2d = nullptr;
+    cudaStream_t stream_compute = nullptr;
+    CUDA_CHECK(cudaStreamCreate(&stream_h2d));
+    CUDA_CHECK(cudaStreamCreate(&stream_compute));
+    gpu_ae.set_compute_stream(stream_compute);
+
+    cudaEvent_t h2d_ready[2];
+    CUDA_CHECK(cudaEventCreateWithFlags(&h2d_ready[0], cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&h2d_ready[1], cudaEventDisableTiming));
+
+    size_t batch_elems = static_cast<size_t>(batch_size) * 3 * 32 * 32;
+    size_t batch_bytes = batch_elems * sizeof(float);
+    float* h_pinned[2] = {nullptr, nullptr};
+    CUDA_CHECK(cudaMallocHost(&h_pinned[0], batch_bytes));
+    CUDA_CHECK(cudaMallocHost(&h_pinned[1], batch_bytes));
+
     // =========================
     // Training Loop
     // =========================
@@ -74,21 +91,32 @@ int main(int argc, char** argv) {
         int num_batches = train_loader.num_batches();
         size_t peak_used_bytes = 0;
 
-        while (train_loader.has_next()) {
-            auto batch_data = train_loader.next();
-            const Tensor& x = batch_data.images;
-
-            // Bỏ qua batch cuối nếu không đủ size (do code GPU fix cứng size)
-            if (x.N() != batch_size) {
-                continue;
+        auto stage_next_batch = [&](int buffer_index) -> bool {
+            while (train_loader.has_next()) {
+                auto batch_data = train_loader.next();
+                const Tensor& x = batch_data.images;
+                if (x.N() != batch_size) {
+                    continue;
+                }
+                std::memcpy(h_pinned[buffer_index], x.raw().data(), batch_bytes);
+                gpu_ae.stage_input_async(h_pinned[buffer_index], buffer_index, stream_h2d);
+                CUDA_CHECK(cudaEventRecord(h2d_ready[buffer_index], stream_h2d));
+                return true;
             }
+            return false;
+        };
 
-            // ----- v1.4 THAY ĐỔI LỚN TẠI ĐÂY -----
-            // Thay vì: forward -> lấy về CPU -> tính Loss CPU -> đẩy Gradient xuống GPU
-            // Ta dùng: train_step (Mọi thứ diễn ra trên GPU, chỉ trả về loss float)
-            
-            float loss = gpu_ae.train_step(x, lr);
-            
+        bool have_curr = stage_next_batch(0);
+        bool have_next = stage_next_batch(1);
+        int cur = 0;
+        int next = 1;
+
+        while (have_curr) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream_compute, h2d_ready[cur], 0));
+            gpu_ae.set_active_input_buffer(cur);
+
+            float loss = gpu_ae.train_step_device(lr);
+
             epoch_loss += loss;
             ++train_nb;
 
@@ -97,13 +125,22 @@ int main(int argc, char** argv) {
             cudaMemGetInfo(&free_bytes, &total_bytes);
             peak_used_bytes = std::max(peak_used_bytes, total_bytes - free_bytes);
 
-            // Print progress (cập nhật trên cùng 1 dòng cho gọn)
             if (train_nb % 10 == 0 || train_nb == num_batches) {
                 std::cout << "\r[Epoch " << ep << "/" << epochs << "] "
                           << "Batch " << train_nb << "/" << num_batches 
                           << " | Loss: " << std::fixed << std::setprecision(4) << (epoch_loss / train_nb) 
                           << std::flush;
             }
+
+            if (!have_next) {
+                break;
+            }
+
+            int old = cur;
+            cur = next;
+            next = old;
+            have_curr = true;
+            have_next = stage_next_batch(next);
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -116,6 +153,7 @@ int main(int argc, char** argv) {
                   << (peak_used_bytes / (1024.0 * 1024.0)) << " MiB\n";
 
         // Save weights
+        CUDA_CHECK(cudaStreamSynchronize(stream_compute));
         gpu_ae.save_weights(out_dir + "/weights_epoch_" + std::to_string(ep) + ".bin");
     }
 
@@ -142,6 +180,13 @@ int main(int argc, char** argv) {
 
     std::cout << "Final Test MSE Loss: " << (test_loss / test_nb) << "\n";
     std::cout << "Done. Check ./" << out_dir << " for weights.\n";
+
+    CUDA_CHECK(cudaFreeHost(h_pinned[0]));
+    CUDA_CHECK(cudaFreeHost(h_pinned[1]));
+    CUDA_CHECK(cudaEventDestroy(h2d_ready[0]));
+    CUDA_CHECK(cudaEventDestroy(h2d_ready[1]));
+    CUDA_CHECK(cudaStreamDestroy(stream_h2d));
+    CUDA_CHECK(cudaStreamDestroy(stream_compute));
 
     cudaDeviceReset();
     return 0;

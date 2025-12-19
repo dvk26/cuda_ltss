@@ -36,10 +36,18 @@ public:
     GPUAutoencoder(int batch_size, int H = 32, int W = 32);
     ~GPUAutoencoder();
 
+    // Stream control (for async H2D + compute overlap).
+    void set_compute_stream(cudaStream_t stream);
+
+    // Stage input into device buffers on a chosen stream.
+    void stage_input_async(const float* h_x, int buffer_index, cudaStream_t stream);
+    void set_active_input_buffer(int buffer_index);
+
     // --- API v1.4: Full GPU Training Pipeline ---
     // Chạy toàn bộ 1 bước train trên GPU: Forward -> MSE Loss -> Backward -> Update
     // Trả về: Giá trị Loss (float) để hiển thị
     float train_step(const Tensor& x_host, float lr);
+    float train_step_device(float lr);
 
     // Tính loss trên tập test (chỉ Forward + MSE)
     float compute_loss(const Tensor& x_host);
@@ -68,8 +76,12 @@ private:
     float *d_w5_, *d_b5_, *d_gw5_, *d_gb5_;
 
     // ---------- Activations ----------
-    float* d_x_;       // Input (FP32) [N,3,H,W]
-    __half* d_xh_;     // Input (FP16) [N,3,H,W]
+    float* d_x_;       // Active input (FP32) [N,3,H,W]
+    __half* d_xh_;     // Active input (FP16) [N,3,H,W]
+    float* d_x_buf_[2];
+    __half* d_xh_buf_[2];
+    int active_input_index_ = 0;
+    cudaStream_t compute_stream_ = 0;
 
     // Encoder (FP16 activations; ReLU output stored directly in d_c*)
     __half* d_c1_; __half* d_p1_;
@@ -127,6 +139,14 @@ private:
     // ---------- Manual checkpointing ----------
     enum class CheckpointMode { none, stage_boundaries };
     CheckpointMode checkpoint_mode_;
+
+    // ---------- Workspace for filter gradient reduction ----------
+    // Reduction is performed in a fixed chunk order for repeatable results
+    // (numerical drift vs. atomic accumulation is expected).
+    float* d_filter_workspace_ = nullptr;
+    float* d_bias_workspace_ = nullptr;
+    size_t filter_workspace_elems_ = 0;
+    size_t bias_workspace_elems_ = 0;
 
     // ---------- Helpers ----------
     void alloc_all();

@@ -14,4 +14,11 @@ Based on my research, here's what I found:
 
 Which approach aligns best with your vision?
 
+## My Vision
 Don't focus on the maxpool backward kernel. Please focus optimizing on these 3 kernels: `conv2d_backward_filter_kernel_fp16x`, `conv2d_relu_forward_tiled_kernel_fp16io`, `conv2d_backward_data_tiled_kernel`.
+
+I want you to use at least 2 streams: 1 stream to load the (N+1)th batch from host to device while the other stream orchestrating the GPU to processing Nth batch.
+
+Optimize the `conv2d_backward_filter_kernel_fp16x` kernel further using shared memory to store tiles.
+
+Carefully examine the training pipeline again to make sure using synchronize only when we need loss values for logging.
