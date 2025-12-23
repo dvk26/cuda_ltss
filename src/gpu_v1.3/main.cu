@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
     // Với v1.4 (Fusion + Shared Mem), bộ nhớ được tiết kiệm nên có thể tăng batch_size
     // Tuy nhiên giữ 64 để so sánh tốc độ với bản cũ cho khách quan.
     int batch_size = 64; 
-    int epochs = 20;
+    int epochs = 1;
     float lr = 1e-3f;
 
     // Tạo thư mục output
