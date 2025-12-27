@@ -20,16 +20,17 @@ Nếu không có flag này thì sử dụng toàn bộ dữ liệu.
 ```
 # GPU version
 !nvcc -std=c++17 -O2 \
-    src/gpu/main.cu \
-    src/gpu/gpu_autoencoder.cu \
-    -I./src/gpu \
+    src/gpu_<version>/main.cu \
+    src/gpu_<version>/gpu_autoencoder.cu \
+    -I./src/gpu_<version> \
     -arch=sm_75 \
-    -o autoencoder_gpu
+    -o autoencoder_gpu_<version>
 ```
+trong đó `<version>` là tên phiên bản, bao gồm v1.1, v1.3 và v1.4.
 
 2. Chạy chương trình: 
 ```
-!./autoencoder_gpu cifar-10-batches-bin [--keep-partial]
+!./autoencoder_gpu_<version> cifar-10-batches-bin [--keep-partial]
 ```
 `--keep-partial` có tác dụng tương tự như bản CPU.
 
